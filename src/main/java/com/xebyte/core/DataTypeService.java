@@ -3540,6 +3540,59 @@ public class DataTypeService {
             }
         }
 
+        // Array bounds checks. Arrays without a concrete element type silently
+        // dropped before; negatives flipped to zero; overflow on element_size *
+        // array_length could exceed the address space. Reject all three up-front
+        // so callers get an actionable error instead of a misleading "success".
+        if (arrayLength < 0) {
+            return Response.ok(JsonHelper.mapOf(
+                    "status", "rejected",
+                    "error", "invalid_array_length",
+                    "array_length", arrayLength,
+                    "message", "array_length must be >= 0.",
+                    "suggestion", "Pass 0 (or omit) for a single value; pass a positive integer for a fixed-length array."
+            ));
+        }
+        if (arrayLength > 0 && resolvedType == null) {
+            return Response.ok(JsonHelper.mapOf(
+                    "status", "rejected",
+                    "error", "array_length_requires_type",
+                    "array_length", arrayLength,
+                    "type_name", typeName == null ? "" : typeName,
+                    "message", "array_length can only be applied when type_name resolves to a concrete element type.",
+                    "suggestion", "Provide a non-empty type_name together with array_length, or omit array_length to leave the existing layout untouched."
+            ));
+        }
+        if (arrayLength > 0 && resolvedType != null) {
+            int elementLen = resolvedType.getLength();
+            if (elementLen <= 0) {
+                return Response.ok(JsonHelper.mapOf(
+                        "status", "rejected",
+                        "error", "invalid_element_size",
+                        "type_name", typeName,
+                        "element_length", elementLen,
+                        "message", "Element type has non-positive size; cannot form an array.",
+                        "suggestion", "Use a sized type (e.g., uint, byte, a fully-defined struct) as the array element."
+                ));
+            }
+            // Overflow guard: element_size * array_length must fit in int and
+            // stay within a sane upper bound (16 MiB caps any one global).
+            long totalLen = (long) elementLen * arrayLength;
+            final int MAX_TOTAL = 16 * 1024 * 1024;
+            if (totalLen > MAX_TOTAL) {
+                return Response.ok(JsonHelper.mapOf(
+                        "status", "rejected",
+                        "error", "array_too_large",
+                        "array_length", arrayLength,
+                        "element_length", elementLen,
+                        "total_bytes", totalLen,
+                        "max_bytes", MAX_TOTAL,
+                        "message", "array_length * element_size exceeds the 16 MiB single-global cap.",
+                        "suggestion", "Split into multiple smaller arrays, or increase the cap if this is intentional."
+                ));
+            }
+        }
+
         // Single transaction: type → array → name → plate comment.
         final List<String> applied = new ArrayList<>();
         final AtomicReference<String> errorMsg = new AtomicReference<>();
