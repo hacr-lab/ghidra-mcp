@@ -134,13 +134,17 @@ def compute_per_binary_inventory(
 
 
 def status_for(rec: dict) -> str:
-    """Derive the per-binary status from its inventory record."""
+    """Derive the per-binary status from its inventory record. Records
+    with `total=0` are never reported as "complete" — that combination
+    used to be the bug signature for "scorer ran into a closed binary
+    and stamped zeros." `_missing_for` treats those records as re-
+    pickable; status reflects that by returning "untouched" / "in_progress"
+    instead of misleading the user with a false "complete"."""
     total = rec.get("total_documentable", 0) or 0
     scored = rec.get("scored", 0) or 0
     last = rec.get("last_scan")
     if total == 0:
-        # Either no documentable functions or we haven't fetched the list yet.
-        return "untouched" if last is None else "complete"
+        return "untouched" if last is None else "in_progress"
     if scored >= total:
         return "complete"
     if scored == 0 and last is None:
@@ -148,13 +152,44 @@ def status_for(rec: dict) -> str:
     return "in_progress"
 
 
+def _pick_least_recent(
+    inventory: dict,
+    candidate_paths: list,
+    blacklist: set,
+) -> Optional[str]:
+    """Force-on fallback: pick the binary whose `last_scan` is oldest
+    (or never-scanned), skipping blacklisted entries. Used by `_run` only
+    when force-on is engaged AND every binary already looks complete; the
+    re-walk surfaces stale data faster than waiting for legitimate
+    invalidation. Sort key: (0, "") for never-scanned wins over (1, ts)
+    for scanned; among scanned, oldest ISO timestamp wins."""
+    best_path = None
+    best_key = None
+    for path in candidate_paths:
+        if path in blacklist:
+            continue
+        last = (inventory.get(path) or {}).get("last_scan")
+        key = (0, "") if last is None else (1, last)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_path = path
+    return best_path
+
+
 def _missing_for(rec: dict) -> int:
     """Returns the number of unscored documentable functions for one
-    inventory record. Unfetched binaries get a small positive sentinel so
-    they sort above fully-complete ones."""
+    inventory record. Any record with total=0 is treated as re-pickable
+    (sentinel=1):
+      * `total=0 AND last_scan is None` — never walked, sentinel applies as before.
+      * `total=0 AND last_scan is set` — bug signature from a pre-fix scorer
+        run that stamped an empty fetch as "0/0 complete". Auto-heal: treat
+        as unfetched-equivalent so the fixed scorer re-walks it. The bug
+        that produced this signature is fixed in `_score_one_binary` (empty
+        fetch now records a failure rather than stamping zeros), so going
+        forward this branch only catches legacy bad data."""
     total = rec.get("total_documentable", 0) or 0
     scored = rec.get("scored", 0) or 0
-    if total == 0 and rec.get("last_scan") is None:
+    if total == 0:
         return 1
     return max(0, total - scored)
 
@@ -286,6 +321,13 @@ class InventoryScorer:
         self._idle_sleep = idle_sleep
 
         self._enabled = False
+        # `_force_on` overrides every loop-level pause condition (doc workers
+        # active, no-pending-target). When true: we ignore worker activity,
+        # and when pick_next_binary returns None we re-walk the least-recently
+        # scanned binary instead of pausing. Trade-off accepted by user (Q3=C):
+        # the scorer's read-only HTTP calls share thread-pool slots with doc
+        # workers, so contention may slow workers slightly while engaged.
+        self._force_on = False
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
@@ -344,6 +386,7 @@ class InventoryScorer:
         with self._lock:
             return {
                 "enabled": self._enabled,
+                "force_on": self._force_on,
                 "running": bool(
                     self._thread and self._thread.is_alive() and self._enabled
                 ),
@@ -355,6 +398,15 @@ class InventoryScorer:
                     p for p, n in self._fail_streak.items() if n >= self._fail_strikes
                 ],
             }
+
+    def set_force_on(self, force_on: bool) -> None:
+        """Toggle force-on mode (Q3=C). When true, the run loop ignores
+        the doc-workers-active pause and the inventory-complete pause —
+        falling through to a least-recently-scanned re-walk when there's
+        nothing legitimately pending. Idempotent."""
+        with self._lock:
+            self._force_on = bool(force_on)
+        self._notify()
 
     def clear_blacklist(self, path: Optional[str] = None) -> None:
         """Clear the session blacklist for one path or all paths. Used by
@@ -372,7 +424,7 @@ class InventoryScorer:
         active, scores it chunk-at-a-time with pause checks between chunks."""
         while not self._stop_event.is_set():
             try:
-                if self._wm.has_active_workers():
+                if self._wm.has_active_workers() and not self._force_on:
                     self._set_paused("doc workers active")
                     self._sleep_or_exit(self._idle_sleep)
                     continue
@@ -396,9 +448,20 @@ class InventoryScorer:
                     current_path=self._resolve_current_path(programs),
                 )
                 if target is None:
-                    self._set_paused("inventory complete")
-                    self._sleep_or_exit(self._idle_sleep)
-                    continue
+                    if self._force_on:
+                        # Force-on fallback: re-walk the least-recently
+                        # scanned binary (skipping blacklist) so the loop
+                        # doesn't sit idle when the user has explicitly
+                        # asked it to keep running.
+                        target = _pick_least_recent(
+                            inventory,
+                            [p["path"] for p in programs],
+                            blacklist,
+                        )
+                    if target is None:
+                        self._set_paused("inventory complete")
+                        self._sleep_or_exit(self._idle_sleep)
+                        continue
 
                 self._clear_paused()
                 with self._lock:
@@ -532,6 +595,13 @@ class InventoryScorer:
         if func_list is None:
             self._record_failure(prog_path, "fetch_function_list returned None")
             return
+        if not func_list:
+            # Empty list means the binary couldn't be opened on demand or
+            # /list_functions_enhanced returned []. Stamping "0/0 complete"
+            # would lock the binary out forever (see commit history); record
+            # a strike instead so the strike+blacklist machinery handles it.
+            self._record_failure(prog_path, "fetch_function_list returned empty list")
+            return
 
         # Build documentable view + which need scoring.
         documentable = [
@@ -572,9 +642,12 @@ class InventoryScorer:
         for i in range(0, len(addrs_to_score), self._chunk_size):
             if self._stop_event.is_set():
                 return
-            if self._wm.has_active_workers():
+            if self._wm.has_active_workers() and not self._force_on:
                 # Q7: cooperative pause at chunk boundary, release implicit
                 # (we hold no Ghidra-side handles; _batch_score is per-call).
+                # Force-on bypasses this check (per Q3=C) — symmetric with
+                # the outer-loop bypass; without it, scoring loops over the
+                # same binary forever when workers stay active.
                 self._set_paused("doc workers active mid-scan")
                 return
 

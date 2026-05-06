@@ -48,6 +48,9 @@ PROGRAMS_TTL_SECONDS = 300
 
 def status_for(rec: dict) -> str:
     """Derive the per-binary global-coverage status from its record.
+    Records with `total=0` are never reported as "complete" — that
+    combination used to be the bug signature for "scorer ran into a
+    closed binary and stamped zeros." Status reflects re-pickable state.
 
     Mirrors inventory_scorer.status_for. A binary's globals are "complete"
     when every documentable global has zero issues; "in_progress" while
@@ -57,7 +60,7 @@ def status_for(rec: dict) -> str:
     fully = rec.get("fully_documented", 0) or 0
     last = rec.get("last_scan")
     if total == 0:
-        return "untouched" if last is None else "complete"
+        return "untouched" if last is None else "in_progress"
     if fully >= total:
         return "complete"
     if fully == 0 and last is None:
@@ -65,15 +68,63 @@ def status_for(rec: dict) -> str:
     return "in_progress"
 
 
+def _pick_least_recent(
+    inventory: dict,
+    candidate_paths: list,
+    blacklist: set,
+) -> Optional[str]:
+    """Force-on fallback: pick the oldest-scanned binary so the re-walk
+    surfaces stale data first. Mirrors inventory_scorer._pick_least_recent."""
+    best_path = None
+    best_key = None
+    for path in candidate_paths:
+        if path in blacklist:
+            continue
+        last = (inventory.get(path) or {}).get("last_scan")
+        key = (0, "") if last is None else (1, last)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_path = path
+    return best_path
+
+
 def _has_pending(rec: dict) -> int:
     """Returns the number of globals still needing documentation for one
-    inventory record. Unfetched binaries get a small positive sentinel so
-    they sort above fully-complete ones."""
+    inventory record. Any record with total=0 is treated as re-pickable
+    (sentinel=1):
+      * `total=0 AND last_scan is None` — never walked, sentinel applies as before.
+      * `total=0 AND last_scan is set` — bug signature from a pre-fix scorer
+        run that stamped an empty fetch as "0/0 complete". Auto-heal: treat
+        as unfetched-equivalent so the fixed scorer re-walks it. The bug
+        that produced this signature is fixed in `_audit_one_binary` (empty
+        list now records a failure rather than stamping zeros)."""
     total = rec.get("total_documentable", 0) or 0
     fully = rec.get("fully_documented", 0) or 0
-    if total == 0 and rec.get("last_scan") is None:
+    if total == 0:
         return 1
     return max(0, total - fully)
+
+
+# Once a binary has been audited, suppress re-picks for this long. Without
+# this, "most-with-issues first" ordering kept selecting D2Game.dll forever
+# after a successful walk because its 328 unresolved issues outranked every
+# other candidate. The scorer needs to rotate through every binary at least
+# once before re-auditing any of them. Doc-worker fixes for a given binary
+# will be reflected on the next cycle.
+RESCAN_COOLDOWN_SECONDS = 3600
+
+
+def _scan_age_seconds(rec: dict) -> float:
+    """Seconds since this binary was last scanned. Returns infinity when
+    never scanned (or the timestamp is unparseable) so never-walked
+    binaries always sort ahead of any scanned candidate."""
+    last = rec.get("last_scan")
+    if not last:
+        return float("inf")
+    try:
+        return (datetime.now() - datetime.fromisoformat(last)).total_seconds()
+    except (ValueError, TypeError):
+        return float("inf")
 
 
 def pick_next_binary(
@@ -81,35 +132,56 @@ def pick_next_binary(
     candidate_paths: list,
     blacklist: set,
     current_path: Optional[str] = None,
+    rescan_cooldown_seconds: float = RESCAN_COOLDOWN_SECONDS,
 ) -> Optional[str]:
     """Pick the next binary to audit.
 
-    When `current_path` is set and that path is in `candidate_paths`, not
-    blacklisted, and still has pending globals, it wins unconditionally —
-    the user's focused binary always gets backfilled first. Otherwise,
-    most-globals-with-issues first; reverse-alpha tiebreak (matches
-    inventory_scorer's Q4 ordering). Skip blacklisted paths. None when
-    nothing eligible."""
-    if current_path and current_path in candidate_paths and current_path not in blacklist:
-        rec = inventory.get(current_path) or {}
-        if _has_pending(rec) > 0:
-            return current_path
+    Priority:
+      1. `current_path` (the user's focused binary), if it has pending
+         issues and is past the cooldown window.
+      2. Never-scanned binaries with pending issues — primary backlog.
+      3. Stale-scanned binaries (last scan older than cooldown) with
+         pending issues — oldest first, so the rotation revisits the
+         binary that's gone the longest without an update.
 
-    best_path = None
-    best_key = None
-    for path in candidate_paths:
+    Returns None when every binary has either no pending issues or was
+    scanned within the cooldown — that's the legitimate "everything's
+    covered, sit idle until a recent scan ages out" state.
+
+    The cooldown is the fix for the production loop where a 328-issue
+    binary kept winning the most-issues tiebreak and got re-walked every
+    few seconds, blocking the other 30 binaries from ever being scanned.
+    """
+    # Helper to apply the same cooldown rule everywhere.
+    def _eligible(path: str) -> bool:
         if path in blacklist:
-            continue
+            return False
         rec = inventory.get(path) or {}
-        with_issues = _has_pending(rec)
-        if with_issues <= 0:
-            continue
-        name = rec.get("name") or Path(path).name
-        key = (with_issues, name)
-        if best_key is None or key > best_key:
-            best_key = key
-            best_path = path
-    return best_path
+        if _has_pending(rec) <= 0:
+            return False
+        return _scan_age_seconds(rec) >= rescan_cooldown_seconds
+
+    if current_path and current_path in candidate_paths and _eligible(current_path):
+        return current_path
+
+    eligible = [p for p in candidate_paths if _eligible(p)]
+    if not eligible:
+        return None
+
+    # Sort largest-tuple-first via reverse=True. Primary key is scan age
+    # (largest age = oldest = goes first; never-scanned has inf age and
+    # naturally wins). Tiebreaks preserve the legacy "most-missing,
+    # reverse-alpha" ordering for equal ages — relevant on the initial
+    # pass when every binary is unscanned.
+    eligible.sort(
+        key=lambda p: (
+            _scan_age_seconds(inventory.get(p) or {}),
+            _has_pending(inventory.get(p) or {}),
+            (inventory.get(p) or {}).get("name") or Path(p).name,
+        ),
+        reverse=True,
+    )
+    return eligible[0]
 
 
 def _inventory_path(base_dir: Path) -> Path:
@@ -193,6 +265,9 @@ class GlobalScorer:
         self._idle_sleep = idle_sleep
 
         self._enabled = False
+        # Force-on overrides every loop-level pause. See inventory_scorer
+        # for the full rationale (Q3=C trade-off accepted).
+        self._force_on = False
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
@@ -237,6 +312,7 @@ class GlobalScorer:
         with self._lock:
             return {
                 "enabled": self._enabled,
+                "force_on": self._force_on,
                 "running": bool(
                     self._thread and self._thread.is_alive() and self._enabled
                 ),
@@ -248,6 +324,12 @@ class GlobalScorer:
                     p for p, n in self._fail_streak.items() if n >= self._fail_strikes
                 ],
             }
+
+    def set_force_on(self, force_on: bool) -> None:
+        """Toggle force-on mode (Q3=C). Mirrors InventoryScorer.set_force_on."""
+        with self._lock:
+            self._force_on = bool(force_on)
+        self._notify()
 
     def clear_blacklist(self, path: Optional[str] = None) -> None:
         with self._lock:
@@ -261,7 +343,7 @@ class GlobalScorer:
     def _run(self) -> None:
         while not self._stop_event.is_set():
             try:
-                if self._wm.has_active_workers():
+                if self._wm.has_active_workers() and not self._force_on:
                     self._set_paused("doc workers active")
                     self._sleep_or_exit(self._idle_sleep)
                     continue
@@ -284,9 +366,16 @@ class GlobalScorer:
                     current_path=self._resolve_current_path(programs),
                 )
                 if target is None:
-                    self._set_paused("global inventory complete")
-                    self._sleep_or_exit(self._idle_sleep)
-                    continue
+                    if self._force_on:
+                        target = _pick_least_recent(
+                            inventory,
+                            [p["path"] for p in programs],
+                            blacklist,
+                        )
+                    if target is None:
+                        self._set_paused("global inventory complete")
+                        self._sleep_or_exit(self._idle_sleep)
+                        continue
 
                 self._clear_paused()
                 with self._lock:
@@ -391,8 +480,25 @@ class GlobalScorer:
                 }
         return out
 
+    # Stamp progress every N audited globals so partial work survives
+    # mid-scan interruptions (pause, stop, exception). Sized small enough
+    # that a typical pause loses < 1s of work, large enough to keep the
+    # inventory.json write rate reasonable.
+    AUDIT_STAMP_EVERY = 50
+
+    # An audit walk is treated as successful (and stamped fully complete)
+    # as long as fewer than this fraction of audits raised exceptions.
+    # Above the threshold, the binary is treated as broken and gets a
+    # strike — protects against runaway walks where every audit fails.
+    AUDIT_FAILURE_RATIO = 0.5
+
     def _audit_one_binary(self, prog_path: str) -> None:
-        """Walk every global in the program, audit it, and tally totals."""
+        """Walk every global in the program, audit it, and tally totals.
+        Stamps progress incrementally every AUDIT_STAMP_EVERY entries so
+        partial work survives any mid-walk pause / stop / individual audit
+        exception. Single audit exceptions are skipped (counted as errors,
+        not fatal) so one malformed address can't kill a thousand-global
+        walk — that was the original "no progress on D2Game.dll" symptom."""
         try:
             globals_list = self._list_globals_for_program(prog_path)
         except Exception as exc:  # noqa: BLE001
@@ -401,15 +507,34 @@ class GlobalScorer:
         if globals_list is None:
             self._record_failure(prog_path, "list_globals returned None")
             return
+        if not globals_list:
+            # Empty list = couldn't open the binary or /list_globals returned
+            # []. Stamping "0/0 complete" would lock the binary out forever
+            # (legacy bug). Record a strike so the blacklist machinery handles
+            # it instead.
+            self._record_failure(prog_path, "list_globals returned empty list")
+            return
 
         prog_name = Path(prog_path).name
+        total_to_audit = len(globals_list)
         total = 0
         fully = 0
-        for entry in globals_list:
+        errors = 0
+        last_stamp_at = 0
+        print(
+            f"  [global-scorer] {prog_name}: auditing {total_to_audit} globals",
+            flush=True,
+        )
+
+        for idx, entry in enumerate(globals_list):
             if self._stop_event.is_set():
+                self._stamp_partial(prog_path, prog_name, total, fully)
                 return
-            if self._wm.has_active_workers():
-                # Cooperative pause — same pattern as inventory_scorer.
+            if self._wm.has_active_workers() and not self._force_on:
+                # Cooperative pause — partial progress is stamped before
+                # bailing so the next pass can pick up where we left off
+                # (or at least show real numbers in the dashboard).
+                self._stamp_partial(prog_path, prog_name, total, fully)
                 self._set_paused("doc workers active mid-scan")
                 return
             addr = entry.get("address") if isinstance(entry, dict) else entry
@@ -418,30 +543,75 @@ class GlobalScorer:
             try:
                 audit = self._audit_global(prog_path, addr)
             except Exception as exc:  # noqa: BLE001
-                self._record_failure(prog_path, f"audit_global({addr}) raised {exc}")
-                return
+                # Skip individual failures — one bad address must not
+                # abort thousands of successful audits. Tracked in
+                # `errors` and used to detect a fully-broken walk below.
+                errors += 1
+                if errors <= 3:
+                    print(
+                        f"  [global-scorer] {prog_name}: audit_global({addr}) "
+                        f"raised {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                continue
             if not audit:
                 continue
             total += 1
             issues = audit.get("issues") or []
             if not issues:
                 fully += 1
+            # Periodic stamp + console progress so the dashboard sees
+            # work happening before the walk completes.
+            if total - last_stamp_at >= self.AUDIT_STAMP_EVERY:
+                self._stamp_partial(prog_path, prog_name, total, fully)
+                last_stamp_at = total
+                print(
+                    f"  [global-scorer] {prog_name}: {total}/{total_to_audit} "
+                    f"audited, {fully} fully documented",
+                    flush=True,
+                )
 
-        # Stamp the inventory.
-        data = load_inventory(self._state_dir)
-        bins = data.setdefault("binaries", {})
-        bins[prog_path] = {
-            "name": prog_name,
-            "total_documentable": total,
-            "fully_documented": fully,
-            "last_scan": datetime.now().isoformat(),
-        }
-        save_inventory(self._state_dir, data)
+        # Final stamp — full counts.
+        self._stamp_partial(prog_path, prog_name, total, fully)
+
+        # If almost every audit failed, treat the binary as broken so it
+        # eventually gets blacklisted instead of looping forever.
+        if total_to_audit > 0 and errors / max(total_to_audit, 1) >= self.AUDIT_FAILURE_RATIO:
+            self._record_failure(
+                prog_path,
+                f"{errors}/{total_to_audit} audits raised exceptions",
+            )
+            return
 
         with self._lock:
             self._last_progress_at = datetime.now().isoformat()
             self._fail_streak.pop(prog_path, None)
+        print(
+            f"  [global-scorer] {prog_name}: done ({total} audited, "
+            f"{fully} fully documented, {errors} errors)",
+            flush=True,
+        )
         self._notify()
+
+    def _stamp_partial(self, prog_path: str, prog_name: str, total: int, fully: int) -> None:
+        """Write the current tally to global_inventory.json. Called both
+        mid-walk (so partial progress survives interruptions) and at the
+        end of a successful walk."""
+        try:
+            data = load_inventory(self._state_dir)
+            bins = data.setdefault("binaries", {})
+            bins[prog_path] = {
+                "name": prog_name,
+                "total_documentable": total,
+                "fully_documented": fully,
+                "last_scan": datetime.now().isoformat(),
+            }
+            save_inventory(self._state_dir, data)
+        except Exception as exc:  # noqa: BLE001 — never let a stamp failure kill the walk
+            print(
+                f"  [global-scorer] {prog_name}: stamp failed ({type(exc).__name__}: {exc})",
+                flush=True,
+            )
 
     def _record_failure(self, prog_path: str, reason: str) -> None:
         with self._lock:

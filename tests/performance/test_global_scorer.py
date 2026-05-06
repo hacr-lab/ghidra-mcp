@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -77,6 +78,73 @@ def test_pick_next_binary_returns_none_when_all_complete_or_blacklisted():
     }
     assert gs.pick_next_binary(inv, ["/done"], blacklist=set()) is None
     assert gs.pick_next_binary({}, [], blacklist=set()) is None
+
+
+def test_pick_next_binary_skips_recently_scanned_in_favor_of_unscanned():
+    """Production bug fix: after walking a binary that has many unresolved
+    issues, the scorer used to immediately re-pick the same binary because
+    its issue count outranked never-scanned candidates. Now the cooldown
+    filter excludes recent scans, so the rotation reaches every binary."""
+    just_now = datetime.now().isoformat()
+    inv = {
+        "/big_just_walked": {
+            "name": "big",
+            "total_documentable": 328,
+            "fully_documented": 0,
+            "last_scan": just_now,
+        },
+        "/never_walked": {
+            "name": "never",
+            "total_documentable": 0,
+            "fully_documented": 0,
+            "last_scan": None,
+        },
+    }
+    picked = gs.pick_next_binary(
+        inv, ["/big_just_walked", "/never_walked"], blacklist=set()
+    )
+    assert picked == "/never_walked"
+
+
+def test_pick_next_binary_returns_none_when_all_recently_scanned():
+    """Once every binary has been freshly walked, the scorer should pause
+    instead of looping. Doc-worker progress will become visible after the
+    cooldown expires on the next scan."""
+    just_now = datetime.now().isoformat()
+    inv = {
+        "/a": {"name": "a", "total_documentable": 100, "fully_documented": 50, "last_scan": just_now},
+        "/b": {"name": "b", "total_documentable": 200, "fully_documented": 0, "last_scan": just_now},
+    }
+    picked = gs.pick_next_binary(inv, ["/a", "/b"], blacklist=set())
+    assert picked is None
+
+
+def test_pick_next_binary_re_picks_after_cooldown_expires():
+    """A binary that was scanned more than the cooldown ago becomes
+    eligible again — that's how doc-worker fixes get reflected in the
+    inventory."""
+    long_ago = (datetime.now() - timedelta(seconds=7200)).isoformat()  # 2 h
+    inv = {
+        "/stale": {"name": "stale", "total_documentable": 100, "fully_documented": 50, "last_scan": long_ago},
+    }
+    picked = gs.pick_next_binary(inv, ["/stale"], blacklist=set())
+    assert picked == "/stale"
+
+
+def test_pick_next_binary_re_picks_zero_total_with_last_scan():
+    """Auto-heal: a record stamped as `total=0 AND last_scan set` is the
+    bug signature from a pre-fix scorer that wrote zeros for an empty
+    list_globals fetch. The fixed scorer re-walks it."""
+    inv = {
+        "/wedged": {"name": "wedged", "total_documentable": 0, "fully_documented": 0, "last_scan": "2026-04-25T19:21:51"},
+    }
+    picked = gs.pick_next_binary(inv, ["/wedged"], blacklist=set())
+    assert picked == "/wedged"
+
+
+def test_status_for_zero_total_with_last_scan_is_in_progress():
+    rec = {"total_documentable": 0, "fully_documented": 0, "last_scan": "2026-04-25T19:21:51"}
+    assert gs.status_for(rec) == "in_progress"
 
 
 def test_pick_next_binary_unfetched_sentinel():
@@ -274,10 +342,127 @@ def test_audit_one_binary_writes_inventory(tmp_path):
     assert persisted["binaries"]["/a"]["last_scan"] is not None
 
 
+def test_audit_one_binary_skips_individual_audit_exceptions(tmp_path):
+    """Regression: a single audit_global exception must NOT abort the
+    whole walk — that turned a 5000-global D2Game.dll walk into an
+    infinite re-pick loop in production. The walk should skip the bad
+    address and stamp the successful audits."""
+    list_globals_returns = {"/a": [{"address": f"0x{i:04x}"} for i in range(10)]}
+
+    def _audit(prog, addr):
+        if addr == "0x0005":
+            raise RuntimeError("address parse failure")
+        return {"issues": []}
+
+    scorer = gs.GlobalScorer(
+        worker_manager=_FakeWM(),
+        project_folder_getter=lambda: "/proj",
+        state_dir=tmp_path,
+        fetch_programs=lambda folder: [{"path": "/a", "name": "a.dll"}],
+        list_globals_for_program=lambda p: list_globals_returns[p],
+        audit_global=_audit,
+        on_status_change=None,
+    )
+    scorer._audit_one_binary("/a")
+
+    persisted = gs.load_inventory(tmp_path)
+    rec = persisted["binaries"]["/a"]
+    assert rec["total_documentable"] == 9   # 10 globals - 1 exception
+    assert rec["fully_documented"] == 9
+
+
+def test_audit_one_binary_records_failure_on_high_error_rate(tmp_path):
+    """If most audits raise, the binary is treated as broken and gets a
+    strike (so it eventually blacklists), instead of stamping near-empty
+    progress and looping."""
+    list_globals_returns = {"/a": [{"address": f"0x{i:04x}"} for i in range(10)]}
+
+    def _audit(prog, addr):
+        raise RuntimeError("everything fails")
+
+    scorer = gs.GlobalScorer(
+        worker_manager=_FakeWM(),
+        project_folder_getter=lambda: "/proj",
+        state_dir=tmp_path,
+        fetch_programs=lambda folder: [{"path": "/a", "name": "a.dll"}],
+        list_globals_for_program=lambda p: list_globals_returns[p],
+        audit_global=_audit,
+        on_status_change=None,
+    )
+    scorer._audit_one_binary("/a")
+
+    # Strike counter advanced (rather than being reset by a successful walk).
+    assert scorer._fail_streak.get("/a") == 1
+
+
+def test_audit_one_binary_stamps_partial_on_pause(tmp_path):
+    """Mid-scan pause must stamp partial progress so the next loop
+    iteration shows the work that's been done — preventing the infinite
+    re-pick loop where pauses kept resetting the counter to 0."""
+    addrs = [f"0x{i:04x}" for i in range(20)]
+    list_globals_returns = {"/a": [{"address": a} for a in addrs]}
+    audited = {"count": 0}
+    wm = _FakeWM(active=False)
+
+    def _audit(prog, addr):
+        audited["count"] += 1
+        # Trigger pause after 5 audits — but well before the periodic
+        # stamp threshold (50), so we're testing the on-pause stamp,
+        # not the periodic stamp.
+        if audited["count"] >= 5:
+            wm.active = True
+        return {"issues": []}
+
+    scorer = gs.GlobalScorer(
+        worker_manager=wm,
+        project_folder_getter=lambda: "/proj",
+        state_dir=tmp_path,
+        fetch_programs=lambda folder: [{"path": "/a", "name": "a.dll"}],
+        list_globals_for_program=lambda p: list_globals_returns[p],
+        audit_global=_audit,
+        on_status_change=None,
+    )
+    scorer._audit_one_binary("/a")
+
+    persisted = gs.load_inventory(tmp_path)
+    rec = persisted["binaries"]["/a"]
+    # At least the 5 audits before the pause should be persisted.
+    assert rec["total_documentable"] >= 5
+
+
+def test_audit_one_binary_force_on_bypasses_mid_scan_pause(tmp_path):
+    """Regression: when force-on is engaged, the mid-scan worker check
+    must NOT bail out — otherwise the walk never stamps inventory and
+    auto-heal re-picks the binary forever (observed live as a tight
+    list_globals loop on D2Game.dll with no progress)."""
+    list_globals_returns = {
+        "/a": [{"address": f"0x{i:04x}"} for i in range(10)]
+    }
+    wm = _FakeWM(active=True)  # workers always active
+    audit_returns = {("/a", f"0x{i:04x}"): {"issues": []} for i in range(10)}
+
+    scorer = gs.GlobalScorer(
+        worker_manager=wm,
+        project_folder_getter=lambda: "/proj",
+        state_dir=tmp_path,
+        fetch_programs=lambda folder: [{"path": "/a", "name": "a.dll"}],
+        list_globals_for_program=lambda p: list_globals_returns[p],
+        audit_global=lambda p, a: audit_returns.get((p, a)),
+        on_status_change=None,
+    )
+    scorer.set_force_on(True)
+    scorer._audit_one_binary("/a")
+
+    # All 10 globals processed and inventory stamped (not bailed out).
+    persisted = gs.load_inventory(tmp_path)
+    assert persisted["binaries"]["/a"]["total_documentable"] == 10
+    assert persisted["binaries"]["/a"]["fully_documented"] == 10
+
+
 def test_audit_one_binary_pauses_when_workers_active(tmp_path):
-    """Q7-style cooperative pause: at the start of a chunk (here, each
-    global), if workers are active, scorer yields without writing
-    inventory."""
+    """Q7-style cooperative pause: when workers go active mid-walk, the
+    scorer yields. Partial progress is now persisted (so the dashboard
+    shows real numbers instead of repeatedly resetting to zero)."""
     list_globals_returns = {
         "/a": [{"address": f"0x{i:04x}"} for i in range(10)]
     }
@@ -301,10 +486,14 @@ def test_audit_one_binary_pauses_when_workers_active(tmp_path):
         on_status_change=None,
     )
     scorer._audit_one_binary("/a")
-    # First two calls happened, then yielded without persisting.
     assert audit_calls["count"] == 2
     persisted = gs.load_inventory(tmp_path)
-    assert "/a" not in persisted.get("binaries", {})
+    # Partial progress IS now persisted on pause (the fix for the
+    # "tight loop, no progress on D2Game.dll" bug). Two audits happened
+    # before the pause, both fully documented.
+    rec = persisted["binaries"]["/a"]
+    assert rec["total_documentable"] == 2
+    assert rec["fully_documented"] == 2
 
 
 def test_record_failure_blacklists_after_three_strikes(tmp_path):
@@ -335,6 +524,38 @@ def test_audit_one_binary_handles_list_globals_failure(tmp_path):
     )
     scorer._audit_one_binary("/a")
     assert scorer._fail_streak["/a"] == 1
+
+
+def test_audit_one_binary_records_failure_on_empty_list(tmp_path):
+    """Bug fix mirror: empty list_globals must record a failure, not
+    stamp '0/0 complete'."""
+    scorer = _make_scorer(
+        programs=[{"path": "/empty", "name": "empty.dll"}],
+        list_globals_returns={"/empty": []},
+        state_dir=tmp_path,
+    )
+    scorer._audit_one_binary("/empty")
+    persisted = gs.load_inventory(tmp_path)
+    assert "/empty" not in persisted.get("binaries", {})
+    assert scorer._fail_streak.get("/empty") == 1
+
+
+def test_pick_least_recent_global(tmp_path):
+    inv = {
+        "/old": {"last_scan": "2026-01-01T00:00:00"},
+        "/never": {"last_scan": None},
+        "/recent": {"last_scan": "2026-04-25T19:00:00"},
+    }
+    assert gs._pick_least_recent(inv, ["/old", "/never", "/recent"], blacklist=set()) == "/never"
+    assert gs._pick_least_recent(inv, ["/old", "/recent"], blacklist=set()) == "/old"
+    assert gs._pick_least_recent(inv, ["/old", "/recent"], blacklist={"/old"}) == "/recent"
+
+
+def test_set_force_on_updates_status(tmp_path):
+    scorer = _make_scorer(state_dir=tmp_path)
+    assert scorer.get_status()["force_on"] is False
+    scorer.set_force_on(True)
+    assert scorer.get_status()["force_on"] is True
 
 
 def test_set_enabled_idempotent(tmp_path):

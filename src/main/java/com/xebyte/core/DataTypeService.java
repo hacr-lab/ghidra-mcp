@@ -3200,6 +3200,20 @@ public class DataTypeService {
                     severityByIssue.put("callback_signature_missing", "medium");
                 }
             }
+            // Plate-line wrap check (soft) — Ghidra's listing column clips
+            // pre-comment lines past ~80 chars with a truncation ellipsis,
+            // so an unwrapped `Set by: A, B, C, ... 19 names` line displays
+            // as `Set by: A, B, C, Pro.` even though the stored text is
+            // intact. Reading the plate in the listing (the most common
+            // surface) becomes lossy. Surface this as a soft issue so the
+            // worker hard-wraps long lines on the next visit; doesn't
+            // block completion. Helper + threshold live in
+            // NamingConventions so the offline test suite covers them.
+            int maxLineLen = NamingConventions.longestPlateLineLength(plateComment);
+            if (maxLineLen > NamingConventions.PLATE_LINE_CLIP_THRESHOLD) {
+                issues.add("plate_line_too_long");
+                severityByIssue.put("plate_line_too_long", "soft");
+            }
         }
 
         // Severity-aware completion check (Q1=A): soft issues never block

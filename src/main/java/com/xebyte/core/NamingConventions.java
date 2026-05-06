@@ -868,6 +868,38 @@ public final class NamingConventions {
         return null;
     }
 
+    /**
+     * Listing-column clip threshold for plate-comment lines. Ghidra's
+     * default pre-comment column is ~80 chars; lines past this get
+     * truncated with an ellipsis in the listing view, so an unwrapped
+     * `Set by: A, B, C, ... 19 names` displays as `Set by: A, B, Pro.`
+     * even though the stored text is intact. We use 80 as the audit
+     * threshold so the plate-comment is still readable in the most
+     * common reading surface; the prompt asks workers to wrap at 70 to
+     * give a safety margin.
+     */
+    public static final int PLATE_LINE_CLIP_THRESHOLD = 80;
+
+    /**
+     * Length of the longest line in a plate comment (counted by
+     * character count, not display width — tabs count as one). Empty
+     * or null comments return 0.
+     *
+     * <p>Exposed as a static helper so the audit
+     * ({@code DataTypeService.auditGlobalAt}) and any future call site
+     * share the rule without duplicating the line-walk. Callers compare
+     * against {@link #PLATE_LINE_CLIP_THRESHOLD} to decide whether to
+     * surface the soft {@code plate_line_too_long} issue.
+     */
+    public static int longestPlateLineLength(String plateComment) {
+        if (plateComment == null || plateComment.isEmpty()) return 0;
+        int max = 0;
+        for (String line : plateComment.split("\n", -1)) {
+            if (line.length() > max) max = line.length();
+        }
+        return max;
+    }
+
     /** Structured result from {@link #checkGlobalNameQuality(String, String)}. */
     public static final class GlobalNameResult {
         public final boolean ok;
@@ -979,11 +1011,36 @@ public final class NamingConventions {
         if (typeName != null && !typeName.isEmpty()) {
             String hungarianMismatch = validateHungarianPrefix(afterG, typeName);
             if (hungarianMismatch != null) {
+                // Pointer-prefix-with-non-pointer-type is the dominant
+                // friction in production logs: model passes type_name like
+                // "DialogResource" with name "g_pDialogX" expecting the
+                // validator to infer pointer-ness from the struct name.
+                // The validator's pointer check is purely string-based
+                // (typeName.contains("*") || typeName.contains("[")), so
+                // the literal asterisk is required. Surface that
+                // explicitly when it's the obvious fix.
+                boolean typeIsPointer = typeName.contains("*") || typeName.contains("[");
+                boolean prefixWantsPointer = hungarian.equals("p") || hungarian.equals("pp")
+                        || hungarian.equals("pb") || hungarian.equals("pw")
+                        || hungarian.equals("pdw") || hungarian.equals("pn")
+                        || hungarian.equals("pfn") || hungarian.equals("ppfn");
+                String suggestion;
+                if (prefixWantsPointer && !typeIsPointer) {
+                    String pointerType = hungarian.equals("pp") || hungarian.equals("ppfn")
+                            ? typeName + " **"
+                            : typeName + " *";
+                    suggestion = "Prefix '" + hungarian + "' expects a pointer type. "
+                            + "Pass type_name=\"" + pointerType + "\" (with the asterisk) — "
+                            + "the DataTypeManager will resolve it to a pointer-to-" + typeName + ". "
+                            + "Or rename the global without the pointer prefix if it isn't a pointer.";
+                } else {
+                    suggestion = "Either rename the global with a Hungarian prefix that matches '" + typeName
+                            + "', or correct the type so it matches the prefix.";
+                }
                 return GlobalNameResult.reject(
                         "prefix_type_mismatch",
                         "Global '" + name + "' Hungarian prefix '" + hungarian + "' doesn't match type '" + typeName + "'.",
-                        "Either rename the global with a Hungarian prefix that matches '" + typeName
-                                + "', or correct the type so it matches the prefix."
+                        suggestion
                 );
             }
         }

@@ -325,6 +325,138 @@ public class NamingConventionsTest extends TestCase {
         assertEquals("prefix_type_mismatch", r.issue);
     }
 
+    public void testPointerPrefixWithStructTypeSuggestsAddingAsterisk() {
+        // The dominant production-friction pattern: model passes a struct
+        // typeName without asterisk for a pointer-prefix name. Suggestion
+        // must explicitly tell them to add `*` and quote the exact replacement
+        // type so they can copy-paste.
+        NamingConventions.GlobalNameResult r =
+                NamingConventions.checkGlobalNameQuality("g_pDialogJoinMultiplayer", "DialogResource");
+        assertFalse(r.ok);
+        assertEquals("prefix_type_mismatch", r.issue);
+        assertNotNull(r.suggestion);
+        assertTrue("suggestion must include the literal pointer type for copy-paste, was: " + r.suggestion,
+                r.suggestion.contains("DialogResource *"));
+        assertTrue("suggestion must reference type_name= to land in the right slot",
+                r.suggestion.contains("type_name="));
+    }
+
+    public void testDoublePointerPrefixSuggestsDoubleAsterisk() {
+        // pp prefix with single-pointer type — should suggest `**`, not `*`.
+        NamingConventions.GlobalNameResult r =
+                NamingConventions.checkGlobalNameQuality("g_ppRoomTable", "Room");
+        assertFalse(r.ok);
+        assertEquals("prefix_type_mismatch", r.issue);
+        assertTrue("pp prefix should suggest **, was: " + r.suggestion,
+                r.suggestion.contains("Room **"));
+    }
+
+    public void testNonPointerMismatchKeepsGenericSuggestion() {
+        // dw prefix on a struct type — not a pointer mismatch, so the
+        // pointer-aware shortcut shouldn't fire. Validator should fall back
+        // to the generic "rename or correct the type" suggestion without
+        // suggesting a spurious asterisk.
+        NamingConventions.GlobalNameResult r =
+                NamingConventions.checkGlobalNameQuality("g_dwSomeStruct", "DialogResource");
+        assertFalse(r.ok);
+        assertEquals("prefix_type_mismatch", r.issue);
+        assertFalse("non-pointer mismatch must not suggest adding *, was: " + r.suggestion,
+                r.suggestion.contains("DialogResource *"));
+    }
+
+    public void testPointerPrefixWithExistingPointerTypePasses() {
+        // Sanity: when type_name already has *, no rejection.
+        assertTrue(NamingConventions.checkGlobalNameQuality("g_pDialogJoinMultiplayer", "DialogResource *").ok);
+        assertTrue(NamingConventions.checkGlobalNameQuality("g_ppRoomTable", "Room **").ok);
+    }
+
+    public void testGenericDescriptorCommonWords() {
+        // Common-words bucket — should fire as soft warning.
+        assertTrue(NamingConventions.isGenericDescriptor("Data"));
+        assertTrue(NamingConventions.isGenericDescriptor("Buffer"));
+        assertTrue(NamingConventions.isGenericDescriptor("Flag"));
+        assertTrue(NamingConventions.isGenericDescriptor("Value"));
+        assertTrue(NamingConventions.isGenericDescriptor("Result"));
+        assertTrue(NamingConventions.isGenericDescriptor("Status"));
+        assertTrue(NamingConventions.isGenericDescriptor("Handle"));
+        assertTrue(NamingConventions.isGenericDescriptor("Context"));
+        // Trailing digits (Flag1, Buffer3) still flag — strip digits, then
+        // check the underlying word.
+        assertTrue(NamingConventions.isGenericDescriptor("Flag1"));
+        assertTrue(NamingConventions.isGenericDescriptor("Buffer42"));
+    }
+
+    public void testGenericDescriptorGibberishGuard() {
+        // Gibberish bucket — model-hallucination catch.
+        assertTrue(NamingConventions.isGenericDescriptor("Foo"));
+        assertTrue(NamingConventions.isGenericDescriptor("Bar"));
+        assertTrue(NamingConventions.isGenericDescriptor("Test"));
+        assertTrue(NamingConventions.isGenericDescriptor("Sample"));
+        assertTrue(NamingConventions.isGenericDescriptor("Thing"));
+    }
+
+    public void testGenericDescriptorPlaceholderExempt() {
+        // Placeholder convention from CLAUDE.md / step-globals.md must NOT
+        // fire — these are explicitly the *correct* name when semantic
+        // role is uncertain.
+        assertFalse(NamingConventions.isGenericDescriptor("Field1D0"));
+        assertFalse(NamingConventions.isGenericDescriptor("Unk20"));
+        assertFalse(NamingConventions.isGenericDescriptor("Value04"));
+        assertFalse(NamingConventions.isGenericDescriptor("FieldA8"));
+    }
+
+    public void testGenericDescriptorMeaningfulNamesPass() {
+        // Real descriptors should not flag.
+        assertFalse(NamingConventions.isGenericDescriptor("ActiveQuestState"));
+        assertFalse(NamingConventions.isGenericDescriptor("UnitList"));
+        assertFalse(NamingConventions.isGenericDescriptor("DifficultyLevels"));
+        assertFalse(NamingConventions.isGenericDescriptor("PlayerName"));
+        assertFalse(NamingConventions.isGenericDescriptor(""));
+        assertFalse(NamingConventions.isGenericDescriptor(null));
+    }
+
+    public void testIdaReservedPrefixDetection() {
+        // IDA's reserved auto-name prefixes must be flagged — reusing
+        // them in user names breaks downstream tools.
+        assertTrue(NamingConventions.hasIdaReservedPrefix("sub_402011"));
+        assertTrue(NamingConventions.hasIdaReservedPrefix("loc_414e"));
+        assertTrue(NamingConventions.hasIdaReservedPrefix("byte_6fdf6000"));
+        assertTrue(NamingConventions.hasIdaReservedPrefix("dword_6fdf6004"));
+        assertTrue(NamingConventions.hasIdaReservedPrefix("stru_6fdf6010"));
+        assertTrue(NamingConventions.hasIdaReservedPrefix("var_8"));
+        // Case-insensitive.
+        assertTrue(NamingConventions.hasIdaReservedPrefix("SUB_402011"));
+        // Real names don't fire.
+        assertFalse(NamingConventions.hasIdaReservedPrefix("g_dwActiveQuestState"));
+        assertFalse(NamingConventions.hasIdaReservedPrefix("ExceptionList"));
+        assertFalse(NamingConventions.hasIdaReservedPrefix(""));
+        assertFalse(NamingConventions.hasIdaReservedPrefix(null));
+        // Substring match shouldn't fire — must be at start.
+        assertFalse(NamingConventions.hasIdaReservedPrefix("g_dw_var_offset"));
+    }
+
+    public void testOsCanonicalGlobalNamesAreExempt() {
+        // TIB / TEB members applied by Ghidra's PE loader. Renaming
+        // these to g_* form is wrong; the validator must NOT flag them.
+        assertTrue(NamingConventions.isOsCanonicalGlobalName("ExceptionList"));
+        assertTrue(NamingConventions.isOsCanonicalGlobalName("StackBase"));
+        assertTrue(NamingConventions.isOsCanonicalGlobalName("FiberData"));
+        assertTrue(NamingConventions.isOsCanonicalGlobalName("Self"));
+        // Case-insensitive match.
+        assertTrue(NamingConventions.isOsCanonicalGlobalName("exceptionlist"));
+        assertTrue(NamingConventions.isOsCanonicalGlobalName("EXCEPTIONLIST"));
+        // Non-OS names not affected.
+        assertFalse(NamingConventions.isOsCanonicalGlobalName("g_dwActiveQuestState"));
+        assertFalse(NamingConventions.isOsCanonicalGlobalName("dwFlags"));
+        assertFalse(NamingConventions.isOsCanonicalGlobalName(null));
+        assertFalse(NamingConventions.isOsCanonicalGlobalName(""));
+
+        // checkGlobalNameQuality short-circuits to ok for OS labels —
+        // even though they don't start with g_, they're not flagged.
+        assertTrue(NamingConventions.checkGlobalNameQuality("ExceptionList", "void *").ok);
+        assertTrue(NamingConventions.checkGlobalNameQuality("StackBase", "void *").ok);
+    }
+
     public void testGlobalNameWithMatchingTypeAccepted() {
         // dw + uint = match (pure uint check)
         assertTrue(NamingConventions.checkGlobalNameQuality("g_dwActiveQuestState", "uint").ok);
@@ -424,5 +556,70 @@ public class NamingConventionsTest extends TestCase {
         // Word-split is whitespace-based; punctuation glued to a word counts
         // as one token. "Bitmap of, the, player" = 4 tokens — accepted.
         assertNull(NamingConventions.checkGlobalPlateComment("Bitmap of, the, player"));
+    }
+
+    // ---------- longestPlateLineLength (plate_line_too_long support) ----------
+    //
+    // Audit emits a soft `plate_line_too_long` issue when any line in a
+    // plate comment exceeds PLATE_LINE_CLIP_THRESHOLD (80) — Ghidra's
+    // listing column truncates past that. Threshold lives in
+    // NamingConventions so the rule has one source of truth; tests pin
+    // the line-walk behavior.
+
+    public void testLongestPlateLineLengthEmptyAndNull() {
+        assertEquals(0, NamingConventions.longestPlateLineLength(null));
+        assertEquals(0, NamingConventions.longestPlateLineLength(""));
+    }
+
+    public void testLongestPlateLineLengthSingleLine() {
+        String line = "Pointer to the unit list head";
+        assertEquals(line.length(),
+                NamingConventions.longestPlateLineLength(line));
+    }
+
+    public void testLongestPlateLineLengthMultilineReturnsMax() {
+        // Three lines of differing lengths — returns the longest.
+        String plate =
+                "Bitmap of currently-active quests for the player.\n"  // 49
+                + "\n"                                                 // 0
+                + "Set by: ProcessQuestUpdate, InitQuestState\n"       // 41
+                + "Read by: RenderQuestLog";                           // 22
+        assertEquals(49, NamingConventions.longestPlateLineLength(plate));
+    }
+
+    public void testLongestPlateLineLengthCatchesOverlongXrefList() {
+        // Real-world scenario from the g_dwStoredVersion incident:
+        // unwrapped `Set by: A, B, C, ... 19 names` blows past 80
+        // chars. The audit must surface this as `plate_line_too_long`.
+        String overlong = "Set by: SNetCreateLadderGame, "
+                + "SetActiveGameUnitContext, ProcessEntityStateChangeEvents, "
+                + "SomethingElseLong, AndAnotherOne";
+        int len = NamingConventions.longestPlateLineLength(overlong);
+        assertTrue("expected overlong line, got " + len + " chars",
+                len > NamingConventions.PLATE_LINE_CLIP_THRESHOLD);
+    }
+
+    public void testLongestPlateLineLengthAcceptsWrappedShape() {
+        // The canonical wrapped shape from step-globals.md — every line
+        // under threshold (with margin). This exercise ensures the
+        // recommended wrap actually gets the soft issue to clear.
+        String wrapped =
+                "Stored game version used for network protocol compatibility checks.\n"
+                + "\n"
+                + "Set by:\n"
+                + "  SNetCreateLadderGame, SetActiveGameUnitContext,\n"
+                + "  ProcessEntityStateChangeEvents\n"
+                + "Read by:\n"
+                + "  SNetCreateLadderGame, BroadcastGameStateToPlayers,\n"
+                + "  ProcessEntityStateChangeEvents, RetrieveDataByTypeWithBuffer";
+        int len = NamingConventions.longestPlateLineLength(wrapped);
+        assertTrue("wrapped plate should fit in clip threshold; got " + len,
+                len <= NamingConventions.PLATE_LINE_CLIP_THRESHOLD);
+    }
+
+    public void testPlateLineClipThresholdValue() {
+        // Pin the threshold — changing it requires updating the prompt
+        // wrap-target guidance in step-globals.md.
+        assertEquals(80, NamingConventions.PLATE_LINE_CLIP_THRESHOLD);
     }
 }

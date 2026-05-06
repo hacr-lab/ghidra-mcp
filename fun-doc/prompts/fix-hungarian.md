@@ -21,10 +21,10 @@
 4. Scoring is handled externally -- do not call `analyze_function_completeness`.
 
 ## Key Mappings
-- `p` prefix requires pointer type (`void *`, struct pointer, etc.)
-- `dw` prefix requires `uint` or `dword`
-- `n` prefix requires `int` or `short`
-- `b` prefix requires `byte`
-- `f` prefix requires `bool`
-- `w` prefix requires `ushort`
-- `sz`/`lpsz` prefix requires `char *`
+
+The full prefix → type table lives in **`hungarian-table.md`** — that's
+the single source of truth for all scopes (locals, parameters, struct
+fields, globals). Don't restate it here. Refer to that file for the
+complete list (`p`, `pp`, `pfn`, `dw`, `n`, `i`, `b`, `by`, `f`, `w`,
+`sz`, `lpsz`, `lpcsz`, `wsz`, `ll`, `qw`, `fl`, `d`, `c`, `ch`, `l`,
+`h`, `ab`, `aw`, `ad`) and the rules the validator enforces.

@@ -1,7 +1,7 @@
 {
   "version": "5.7.0",
   "description": "GhidraMCP REST API Endpoint Specification",
-  "total_endpoints": 228,
+  "total_endpoints": 231,
   "categories": {
     "listing": "List program data",
     "getter": "Get specific data",
@@ -200,6 +200,31 @@
         "program"
       ],
       "description": "Apply function documentation"
+    },
+    {
+      "path": "/archive_ingest_function",
+      "method": "POST",
+      "category": "documentation",
+      "params": [
+        "address",
+        "program",
+        "version_override",
+        "dry_run"
+      ],
+      "description": "Ingest a single function's documentation into the cross-version archive (re_kb.functions on bsim Postgres). Idempotent; field-level merge resolution happens on the archive side. Use archive_ingest_program for bulk."
+    },
+    {
+      "path": "/archive_ingest_program",
+      "method": "POST",
+      "category": "documentation",
+      "params": [
+        "program",
+        "version_override",
+        "limit",
+        "skip_default_named",
+        "dry_run"
+      ],
+      "description": "Bulk-ingest every function in a program into the cross-version documentation archive. Posts each to /v1/doc_archive/upsert. Returns per-binary counts (created / updated / conflicts_enqueued / errors)."
     },
     {
       "path": "/audit_global",
@@ -1504,6 +1529,10 @@
         "offset",
         "limit",
         "format",
+        "filter",
+        "type_filter",
+        "min_xrefs",
+        "include_all_sections",
         "program"
       ],
       "description": "List data sorted by xref count"
@@ -1581,6 +1610,10 @@
         "offset",
         "limit",
         "filter",
+        "type_filter",
+        "min_xrefs",
+        "include_all_sections",
+        "name_substring",
         "program"
       ],
       "description": "List global variables"
@@ -1706,6 +1739,17 @@
       "category": "utility",
       "params": [],
       "description": "Machine-readable API schema with endpoint metadata"
+    },
+    {
+      "path": "/merge_program_documentation",
+      "method": "POST",
+      "category": "documentation",
+      "params": [
+        "source",
+        "target",
+        "dry_run"
+      ],
+      "description": "Bulk merge: copy all RE documentation (function names, signatures, plate comments, instruction comments at EOL/PRE/POST, non-default labels & global symbols) from one program to another at matching addresses. Server-side iteration in a single transaction. Designed for the orphan-rescue workflow: source is typically '<name>_recovered', target is the original '<name>.dll'. Set dry_run=true to count without writing."
     },
     {
       "path": "/modify_struct_field",

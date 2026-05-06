@@ -288,6 +288,21 @@ After a worker documents a function, a different provider re-examines the result
 
 When enabled, every run writes an `audit_outcome` field into `logs/runs.jsonl` (`improved` / `regressed` / `no_change` / `skipped_good` / `skipped_delta`). The dashboard's "Audit:" line under run stats renders the aggregate. Current default pairing: **minimax** does the primary doc pass, **gemini** does audits (complementary family per model-routing memory).
 
+## Cross-version doc archive (re-kb on bsim Postgres)
+
+Stored at `re_kb.functions` on the bsim Postgres at `10.0.10.30:5432`. Exposed via the re-kb FastAPI service at `http://10.0.10.30:8422`. Source: `re-universe/services/re-kb/`. The system has six pieces:
+
+1. **Schema** — `re_kb.functions` augmented with matching keys (`opcode_hash`, `bsim_signature LSHVECTOR`, shape stats), full doc payload (`locals`, `instruction_comments`, `referenced_data_types`, `referenced_globals`, `referenced_labels`, `equates_referenced` JSONB), and metadata. Companion tables: `doc_field_provenance` (per-field decision history), `doc_conflict_queue` (AI judge backlog), `doc_match_log` (lookup audit).
+2. **REST API** (5 endpoints) — `POST /v1/doc_archive/upsert`, `POST /v1/doc_archive/match`, `GET /v1/doc_archive/{id}/full`, `GET /v1/doc_archive/conflicts`, `POST /v1/doc_archive/conflicts/{id}/resolve`.
+3. **Heuristics** — `app/services/doc_heuristics.py` resolves field-level conflicts (longer plate wins, more typed params wins, etc.) without AI cost. 13 per-field strategies.
+4. **MCP tools** — `archive_ingest_function(address, program)`, `archive_ingest_program(program)` in `DocumentationHashService.java`. Build payload from current Ghidra state, POST to archive's upsert endpoint.
+5. **fun-doc hooks** — write hook in `process_function` after `save_program` calls `/archive_ingest_function`. Read hook before LLM checks `/v1/doc_archive/match`; on Q5-D gate pass (hash exact OR `BSim ≥0.9 AND score ≥80`), applies name + plate via existing MCP tools and skips LLM. `bus_emit("archive_pushed"|"archive_lookup"|"archive_applied"|"archive_apply_failed"|"archive_push_failed")` for dashboard visibility.
+6. **AI conflict worker** — `re-kb-conflict-worker` docker container, polls `/v1/doc_archive/conflicts`, asks Claude Haiku for structured JSON decisions, POSTs back. Idle when queue empty.
+
+Q1-Q6 design decisions are locked in; design rationale lives in commit history. Migration `003_function_doc_archive.sql` applied to bsim DB. Required env: `RE_KB_ARCHIVE_URL` (defaults to `http://10.0.10.30:8422`); empty disables both hooks.
+
+**BSim signature backfill** is a one-shot Ghidra script — `C:\tmp\ghidra_recovery_scripts\Backfill_BSimSignatures.java` — run per binary from CodeBrowser to populate the `bsim_signature` column and unlock tier-2 LSH similarity matching. Tier 1 (opcode hash) works without it.
+
 ## Documentation
 
 - Workflow: `docs/prompts/FUNCTION_DOC_WORKFLOW_V5.md`

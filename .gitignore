@@ -586,6 +586,11 @@ fun-doc/state.json.bak
 fun-doc/state.json.*_bak
 fun-doc/state.json.*.bak
 fun-doc/state.json.corrupt-*
+fun-doc/state.json.truncated-*
+fun-doc/state.json.before-*
+fun-doc/inventory.json.before-*
+fun-doc/global_inventory.json
+fun-doc/global_inventory.json.before-*
 fun-doc/logs/
 fun-doc/priority_queue.json
 fun-doc/debug/

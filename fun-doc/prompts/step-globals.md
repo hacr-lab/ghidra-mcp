@@ -11,19 +11,40 @@ globals — anything that decompiles as `DAT_xxx`, `PTR_DAT_xxx`, `g_*`, or
 named/typed data at a fixed address. Skip when the function references only
 local stack variables, parameters, and structure fields.
 
-## The bar (HARD-ENFORCED)
+## The bar (8-axis rubric, severity-tiered)
 
-A global is "properly documented" when **all four** of these hold:
+A global is "fully documented" when no **hard** or **medium** issues remain.
+**Soft** issues surface as warnings but don't block completion — they're
+notes for a human reviewer, not work the worker must do. The audit
+returns `severity_summary: {hard, medium, soft}` and an `applicable_axes`
+hint per global so you know which sections are semantically relevant
+for THIS global.
 
-1. **Name** — `g_` prefix + Hungarian prefix matching the type + ≥2 chars of descriptor.
+### HARD (must hold for every global)
+
+1. **Name** — `g_` prefix + Hungarian prefix matching the type + ≥2 chars of descriptor. No IDA-reserved prefixes (`sub_`, `loc_`, `byte_`, `dword_`, `unk_`, `var_`, `arg_` etc. — those are sentinels for "untouched" symbols and reusing them breaks downstream tools).
 2. **Type** — a real type (not `undefined1/2/4/8`). Pointer-to-struct when applicable.
-3. **Bytes formatted** — the data at the address is applied as that type, with the right length:
-   - Arrays must specify `array_length` (not just the first element typed).
-   - ASCII null-terminated regions should be applied as `string` / `unicode`, not raw `char[]`.
-   - Struct types lay out their fields automatically.
-4. **Plate comment** — the address has a plate comment whose first line is a meaningful ≥4-word summary.
+3. **Plate present** — the address has a plate comment.
 
-`set_global` rejects any write that violates rule 1, 2, or 4. Rule 3 is checked at audit time.
+### MEDIUM (must hold when applicable)
+
+4. **Bytes formatted** — when the type implies a specific layout, the data must match: arrays specify `array_length`, ASCII regions applied as `string`/`unicode`, struct fields laid out. Soft `bytes_size_unknown` fires when an array type has only one element typed but >1 xref.
+5. **Plate quality** — first line is a meaningful ≥4-word summary.
+6. **Xref summary** (when xref count > 5) — the plate names ≥1 writer or count of readers. Use `Set by:`, `Read by:`, `Used by:`, or `Modified by:` sections, OR mention specific function names. The community treats this as the *substance* of global documentation — knowing who writes vs reads it.
+7. **Bitfield decomposition** (when name contains `Flags`/`Bits`/`Mask`/`State`/`Mode` and type is integer) — plate must include a `Bitfield:` section or per-bit table.
+8. **Callback signature** (when name starts with `g_pfn` or type is a function pointer) — plate describes what calls through, with arg list.
+
+### SOFT (warnings only, won't block "completed")
+
+- **`generic_descriptor`** — descriptor is a low-information word like `Data`, `Buffer`, `Flag`, `Value`, `Result`, `Status`, `Handle`, `Context`, or gibberish like `Foo`/`Test`/`Sample`. Placeholder convention exempt: `Field1D0`, `Unk20`, `Value04` are still considered the *correct* name when semantic role is uncertain.
+- **`bytes_size_unknown`** — single-element array with multiple xrefs.
+
+### Exempt from all checks
+
+- **OS-canonical labels** (`ExceptionList`, `StackBase`, `Teb*`, `Peb*`, `KUSER_SHARED_DATA`, `_acmdln`, `_environ`, IAT thunk targets). The audit short-circuits these as `os_canonical: true, fully_documented: true`. Microsoft's name IS the canonical convention; renaming to `g_*` would destroy cross-binary recognizability.
+- **Code addresses** (function entries, branch targets). The audit short-circuits these as `is_code_address: true`. They're not data globals.
+
+`set_global` rejects any write that violates rules 1, 2, or 5 (hard naming, hard typing, plate ≥4 words). Other rules are checked at audit time.
 
 ## Canonical workflow
 
@@ -80,19 +101,11 @@ set_global(
 
 ## Naming rules
 
-| Hungarian | Type | Example |
-|---|---|---|
-| `g_dw` | `uint` / `dword` | `g_dwActiveQuestState` |
-| `g_n` | `int` / `short` | `g_nPlayerCount` |
-| `g_p` | pointer-to-anything | `g_pUnitList`, `g_pCurrentRoom` |
-| `g_pp` | double-pointer | `g_ppRoomTable` |
-| `g_sz` | `char *` | `g_szPlayerName` |
-| `g_wsz` | `wchar_t *` | `g_wszLocalizedTitle` |
-| `g_ab` | `byte[]` | `g_abPaletteData` |
-| `g_an` | `int[]` | `g_anItemMaxStack` |
-| `g_ad` | `uint[]` | `g_adXpThresholds` |
-| `g_pfn` | function pointer | `g_pfnDispatchHandler` |
-| `g_b` / `g_f` | bool | `g_bIsConnected` / `g_fHostMode` |
+The full Hungarian prefix → type table lives in **`hungarian-table.md`**
+(single source of truth for all scopes). Globals = `g_` outer marker
+plus the prefix from that table plus a descriptor — e.g.,
+`g_dwActiveQuestState`, `g_pUnitList`, `g_szPlayerName`,
+`g_pfnDispatchHandler`.
 
 The descriptor part must:
 - Start with an uppercase letter (PascalCase after the Hungarian prefix).
@@ -105,28 +118,122 @@ Conservative placeholders are explicitly allowed when the global's purpose is ge
 
 This is the same "underclaim with placeholder" convention used for variables — `dwUnknown1D0`, `pUnk20`. A correct neutral name beats a confident wrong one.
 
-## Plate-comment format
+## Plate-comment format (Win32-derived template)
 
-Required: a one-line meaningful summary as the first line (≥4 words). What the global represents and how it's used.
+The community-standard structure (Microsoft Win32 function-header
+template adapted for globals; ReactOS, Wine, and D2MOO all converge on
+this shape):
 
-Optional structured details when applicable:
+```
+<Purpose: one-line semantic summary (mandatory, ≥4 words)>
+
+Type:       <declared type + interpretation, e.g. "DWORD bitfield of UNIT_FLAG_*">
+Range:      <valid values / sentinels / units, e.g. "0..255, -1 = invalid">
+Set by:     <function(s) that write it; init site>
+Read by:    <function(s) that consume it (or "N readers, see xrefs")>
+Related:    <sibling globals, parallel arrays, owning struct>
+Source:     <PDB / header / sibling-version / BSim / inferred-from-string>
+Notes:      <thread-safety, lifetime, gotchas>
+Bitfield:   <bit-by-bit table, only for Flags/Bits/Mask globals>
+  0x0001 = QUEST_DENOFEVIL
+  0x0002 = QUEST_SISTERS_BURIAL
+```
+
+**Mandatory:** the first-line `Purpose` summary.
+
+**Skip empty sections rather than padding with "N/A".** A section that
+isn't applicable is just absent from the plate. Don't write
+`Set by: N/A` or `Range: none` — that's an anti-pattern called out by
+every RE style guide that touches global documentation.
+
+**Wrap long lines to ≤70 characters.** Ghidra's listing column clips
+pre-comment lines past ~80 chars with a truncation ellipsis, so an
+unwrapped `Set by: FooFn, BarFn, BazFn, ...` (19 names) renders as
+`Set by: FooFn, BarFn, BazFn, Pro.` in the listing — the stored text
+is intact but the most common reading surface becomes lossy. Hard-wrap
+lines that would exceed 70 chars; for comma-joined lists, put the
+section header on its own line and break the names with two-space
+indented continuations:
+
+```
+Set by:
+  SNetCreateLadderGame, SetActiveGameUnitContext,
+  ProcessEntityStateChangeEvents
+Read by:
+  SNetCreateLadderGame, BroadcastGameStateToPlayers,
+  ProcessEntityStateChangeEvents, RetrieveDataByTypeWithBuffer
+```
+
+The audit emits a soft `plate_line_too_long` issue when any line
+exceeds 80 chars — soft means it doesn't block completion, but the
+next worker pass on this global will see it and you should fix it
+opportunistically when you visit nearby code. When the xref count is
+high enough that the comma-list still feels noisy after wrapping,
+prefer a one-line summary instead — e.g. `Read by: 14 readers across
+the SNet/Net layer; hot path is BroadcastGameStateToPlayers`.
+
+**Use `applicable_axes` from the audit response** to decide which
+sections to fill. The audit tells you per-global which of
+`xref_summary`, `bitfield_decomp`, `callback_sig`, `value_semantics`
+are relevant for this address. Anything flagged false → skip that
+section entirely.
+
+### Example: low-xref global (most common case)
+
+```
+Pointer to the DifficultyLevels.bin table loaded at startup. Stride 0x58.
+```
+
+That's the entire plate. One line, mandatory `Purpose` only, no sections needed.
+
+### Example: high-xref bitfield with known source
 
 ```
 Bitmap of currently-active quests for the player; bit N = quest N active.
 
-Used by: ProcessQuestUpdate, RenderQuestLog, IsQuestActive
-Layout: 32 bits, low 16 = act 1-2 quests, high 16 = act 3-5
+Set by: ProcessQuestUpdate, InitQuestState
+Read by: RenderQuestLog, IsQuestActive (and 14 other readers)
 Source: QuestC.cpp:0x14
 Bitfield:
   0x0001 = QUEST_DENOFEVIL
   0x0002 = QUEST_SISTERS_BURIAL
-  ...
 ```
 
-Most globals only need the one-liner. Reserve sectioned details for:
-- Tables with a documented stride/count
-- Bitmaps where each bit has a known meaning
-- Globals derived from a known source file
+Sectioned details are warranted because xref_count > 5 (community
+expects a writer/reader summary), name pattern triggers
+`bitfield_undocumented` (must enumerate bits), and the source is known.
+
+### Example: high-xref network global (wrapped)
+
+This is the shape that gets clipped if you don't wrap — 19 xrefs across
+several long-named functions. Indented continuation lines keep every
+line under 70 chars:
+
+```
+Stored game version used for network protocol compatibility checks.
+
+Set by:
+  SNetCreateLadderGame, SetActiveGameUnitContext,
+  ProcessEntityStateChangeEvents
+Read by:
+  SNetCreateLadderGame, BroadcastGameStateToPlayers,
+  ProcessEntityStateChangeEvents, RetrieveDataByTypeWithBuffer,
+  NET_ShutdownGameAndCleanupResources
+```
+
+Note the section headers (`Set by:`, `Read by:`) sit alone on their
+line so the comma list can wrap without ambiguity.
+
+### Example: function pointer (callback)
+
+```
+Damage handler invoked from CombatTick when a unit takes hit damage.
+
+Set by: CombatInit (during module load)
+Called by: CombatTick — invoked as g_pfnDamageHandler(pAttacker, pTarget, dwAmount)
+```
+
+Triggers `callback_signature_missing` if the call signature isn't documented.
 
 ## Handling rejections
 
@@ -139,6 +246,28 @@ Most globals only need the one-liner. Reserve sectioned details for:
 - `unknown_type` — the type isn't in the program's data type manager. Use `create_struct` / `create_array_type` first, then retry.
 - `undefined_type_rejected` — passed `undefined4`/`undefined1`/etc. Pick a real type.
 - `plate_comment_too_short` — first line has fewer than 4 words. Replace with a meaningful summary.
+
+## Audit-time issue codes (not write-blockers)
+
+These come back from `audit_global` in the `issues` array, each tagged
+in `severity_summary`. Hard + medium block `fully_documented`; soft do
+not.
+
+| Code | Severity | What to fix |
+|---|---|---|
+| `untyped` | hard | Apply a real type via `set_global`. |
+| `missing_plate_comment` | hard | Add a one-line ≥4-word summary. |
+| `ida_reserved_prefix` | hard | Rename — never reuse `sub_`/`loc_`/`byte_`/`dword_`/`unk_`/`var_`/`arg_` as a global name. |
+| `name_*` (any) | hard | See rejection list above. |
+| `generic_name` | hard | Name is auto-generated (DAT_*, etc.); pick a meaningful descriptor. |
+| `plate_comment_too_short` | medium | Expand to ≥4 words. |
+| `unformatted_bytes_length_mismatch` | medium | Re-apply type with correct `array_length`. |
+| `unformatted_bytes_should_be_string` | medium | Re-apply as `string` / `unicode`. |
+| `xref_summary_missing` | medium | Add `Set by:` / `Read by:` / `Used by:` sections (xref_count > 5). |
+| `bitfield_undocumented` | medium | Add `Bitfield:` section enumerating bits (name implies flags). |
+| `callback_signature_missing` | medium | Add call signature to the plate (`g_pfn*` or function-pointer type). |
+| `generic_descriptor` | **soft** | Replace generic descriptor (Data/Buffer/Flag/Result/etc.). Doesn't block completion. |
+| `bytes_size_unknown` | **soft** | Document the array length when single-element array has multiple xrefs. |
 
 ## What NOT to do
 

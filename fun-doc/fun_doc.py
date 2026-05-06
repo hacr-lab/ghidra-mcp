@@ -74,6 +74,7 @@ import json
 import multiprocessing
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -174,6 +175,86 @@ except ImportError:
     pass
 
 GHIDRA_URL = os.environ.get("GHIDRA_SERVER_URL", "http://127.0.0.1:8089").rstrip("/")
+
+# Cross-version doc archive (re-kb FastAPI on bsim postgres host).
+# Empty string disables Phase 2 write hooks and Phase 3 read hooks entirely
+# so unit tests / offline runs don't touch the network.
+ARCHIVE_URL = os.environ.get("RE_KB_ARCHIVE_URL", "http://10.0.10.30:8422").rstrip("/")
+
+# Project folder scope guard (Layer 1).
+#
+# When set, every Ghidra MCP call we issue gets its `program` parameter
+# checked against this prefix. Bare binary names get auto-prefixed; out-of-scope
+# absolute paths are rejected before the HTTP call goes out. Set via env var
+# FUN_DOC_PROJECT_FOLDER (overrides any value loaded from state.json) so users
+# repurposing fun-doc for a non-D2 project can scope per environment without
+# editing state on disk. Empty / unset == no enforcement (back-compat).
+#
+# Loaded lazily from state.json the first time the validator is invoked, so we
+# don't force a state.json read at import time. The environment variable wins
+# if both are present.
+_PROJECT_FOLDER_OVERRIDE = (os.environ.get("FUN_DOC_PROJECT_FOLDER") or "").strip().rstrip("/")
+_PROJECT_FOLDER_CACHED: str | None = None  # set by _get_project_folder()
+
+
+def _get_project_folder() -> str:
+    """Return the configured project folder prefix, or '' if unset.
+
+    Priority: FUN_DOC_PROJECT_FOLDER env var > state.json's 'project_folder'
+    field > '' (no enforcement). Result is cached for the process lifetime so
+    a state.json edit takes a worker restart to pick up — same lifetime as
+    the worker config snapshot pattern.
+    """
+    global _PROJECT_FOLDER_CACHED
+    if _PROJECT_FOLDER_CACHED is not None:
+        return _PROJECT_FOLDER_CACHED
+    if _PROJECT_FOLDER_OVERRIDE:
+        _PROJECT_FOLDER_CACHED = _PROJECT_FOLDER_OVERRIDE
+        return _PROJECT_FOLDER_CACHED
+    try:
+        # state.json may not exist yet on a brand-new install; tolerate.
+        with open(STATE_FILE) as f:
+            state = json.load(f)
+        pf = (state.get("project_folder") or "").strip().rstrip("/")
+        _PROJECT_FOLDER_CACHED = pf
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        _PROJECT_FOLDER_CACHED = ""
+    return _PROJECT_FOLDER_CACHED
+
+
+def _validate_program_param(program: str | None) -> tuple[str | None, str | None]:
+    """Validate / normalize a `program` HTTP parameter against the project
+    folder scope guard. Returns (normalized_program, error_message).
+
+    - program empty / None: pass through (caller meant "use currentProgram"),
+      no error.
+    - no project folder configured: pass through, no error (default for
+      general users not using fun-doc's project-folder workflow).
+    - program is a bare binary name (no '/'): auto-prefix to
+      `<project_folder>/<bare>`, no error. (Caller should also surface a
+      warning bus event so we can hunt down the source.)
+    - program starts with `<project_folder>/` or equals `<project_folder>`:
+      pass through, no error.
+    - program starts with anything else: reject with error message; caller
+      should not issue the HTTP call.
+
+    Note the '== prefix or startswith(prefix + "/")' check is deliberate to
+    prevent prefix-collision attacks (e.g. /Mods/PD2-S12-OTHER vs
+    /Mods/PD2-S12).
+    """
+    if program is None or program == "":
+        return program, None
+    pf = _get_project_folder()
+    if not pf:
+        return program, None
+    if "/" not in program:
+        # Bare binary name -> auto-prefix
+        return f"{pf}/{program}", None
+    if program == pf or program.startswith(pf + "/"):
+        return program, None
+    return program, (
+        f"program path '{program}' is outside scoped project folder '{pf}'"
+    )
 
 # ---------------------------------------------------------------------------
 # AI Provider Configuration
@@ -294,9 +375,47 @@ def _parse_response(r):
         return text
 
 
+def _scope_check_params(method: str, path: str, params):
+    """Apply the project-folder scope guard to a `program` parameter, if any.
+
+    Returns (params_normalized, error_dict_or_None). When error_dict is
+    non-None, the caller MUST NOT issue the HTTP call — return the error to
+    avoid leaking writes to out-of-scope binaries.
+    """
+    if not params or "program" not in params:
+        return params, None
+    prog = params.get("program")
+    norm, err = _validate_program_param(prog)
+    if err:
+        # Surface as a bus event AND a return-value error so callers can react.
+        try:
+            bus_emit(
+                "scope_guard_block",
+                {"method": method, "path": path, "program": prog, "reason": err},
+            )
+        except Exception:
+            pass
+        return params, {"error": f"scope guard blocked call: {err}"}
+    if norm != prog:
+        # Auto-prefixed a bare name. Surface a warning so we can hunt the source.
+        try:
+            bus_emit(
+                "scope_guard_normalized",
+                {"method": method, "path": path, "from": prog, "to": norm},
+            )
+        except Exception:
+            pass
+        params = dict(params)
+        params["program"] = norm
+    return params, None
+
+
 def ghidra_get(path, params=None, timeout=60):
     """GET request to Ghidra HTTP server."""
     _reset_ghidra_call_state()
+    params, err = _scope_check_params("GET", path, params)
+    if err is not None:
+        return err
     started = time.perf_counter()
     try:
         r = requests.get(f"{GHIDRA_URL}{path}", params=params, timeout=timeout)
@@ -383,6 +502,9 @@ def ghidra_get(path, params=None, timeout=60):
 def ghidra_post(path, data=None, params=None, timeout=60):
     """POST request to Ghidra HTTP server."""
     _reset_ghidra_call_state()
+    params, err = _scope_check_params("POST", path, params)
+    if err is not None:
+        return err
     started = time.perf_counter()
     try:
         r = requests.post(
@@ -470,6 +592,170 @@ def ghidra_post(path, data=None, params=None, timeout=60):
         )
         print(f"  WARNING: Ghidra POST {path} failed: {e}", file=sys.stderr)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Cross-version doc archive HTTP helpers (re-kb FastAPI)
+# ---------------------------------------------------------------------------
+# Best-effort wrappers — return None on any error so neither the worker hot
+# loop nor the write hook ever fail because the archive is unavailable.
+
+def archive_post(path, data, timeout=15):
+    """POST to the archive. Returns parsed JSON, or None on error / disabled."""
+    if not ARCHIVE_URL:
+        return None
+    try:
+        r = requests.post(f"{ARCHIVE_URL}{path}", json=data, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+
+def archive_get(path, timeout=15):
+    """GET from the archive. Returns parsed JSON, or None on error / disabled."""
+    if not ARCHIVE_URL:
+        return None
+    try:
+        r = requests.get(f"{ARCHIVE_URL}{path}", timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+
+def _extract_archive_identity(program):
+    """Translate a Ghidra program path into (binary_name, version).
+    Mirrors the Java extractVersion() heuristic used by the MCP plugin so
+    upserts and reads agree on the (binary, version) tuple."""
+    parts = (program or "").split("/")
+    binary = parts[-1] if parts else "unknown"
+    # /Mods/PD2-S12/Bnclient.dll -> "PD2-S12"
+    # /Vanilla/1.13d/D2Common.dll -> "1.13d"
+    version = parts[2] if len(parts) >= 3 and parts[2] else "unknown"
+    return binary, version
+
+
+def check_archive_for_match(func, func_name, live_score, run_id):
+    """Phase 3 read hook.
+
+    Query the cross-version doc archive for a hash-exact / high-confidence
+    match. If found AND it passes the Q5-D auto-apply gate, perform a
+    conservative apply (rename + plate comment) and return ('archive_applied',
+    score). Otherwise return (None, None) so the caller falls through to the
+    normal LLM workflow.
+
+    Conservative-by-design: this MVP applies only the function name and
+    plate comment. Locals, prototype, instruction comments, types are left
+    for the LLM (or a follow-up enrichment pass) to fill in. Justification:
+    rename + plate are the lowest-risk, highest-visibility changes; they
+    immediately make the function searchable / readable. The richer fields
+    benefit from a fresh fun-doc pass that can use the now-named function
+    as context.
+    """
+    if not ARCHIVE_URL:
+        return None, None
+
+    address = func.get("address")
+    program = func.get("program")
+    if not address or not program:
+        return None, None
+
+    # Step 1: compute opcode hash via the existing MCP tool.
+    try:
+        h = ghidra_get(
+            "/get_function_hash",
+            params={"address": address, "program": program},
+        )
+        opcode_hash = (h or {}).get("hash") if isinstance(h, dict) else None
+    except Exception:
+        opcode_hash = None
+    if not opcode_hash:
+        return None, None
+
+    binary, version = _extract_archive_identity(program)
+    address_norm = address if address.startswith("0x") else f"0x{address.lstrip('0x')}"
+
+    # Step 2: query the cascade.
+    match = archive_post(
+        "/v1/doc_archive/match",
+        {
+            "binary_name": binary,
+            "version": version,
+            "address": address_norm,
+            "opcode_hash": opcode_hash,
+        },
+    )
+
+    func_key = f"{program}::{address}"
+    bus_emit(
+        "archive_lookup",
+        {
+            "key": func_key,
+            "address": address,
+            "program": program,
+            "match_tier": (match or {}).get("match_tier", "none"),
+            "confidence": (match or {}).get("confidence", 0.0),
+            "gate_pass": (match or {}).get("gate_pass", False),
+            "gate_reason": (match or {}).get("gate_reason", "no_match"),
+            "matched_function_id": (match or {}).get("function_id"),
+            "matched_score": (match or {}).get("score"),
+        },
+    )
+
+    if not match or not match.get("gate_pass"):
+        return None, None
+
+    # Step 3: fetch full doc and apply conservatively.
+    fn_id = match.get("function_id")
+    full = archive_get(f"/v1/doc_archive/{fn_id}/full") if fn_id else None
+    if not full:
+        return None, None
+
+    new_name = full.get("name")
+    plate = full.get("plate_comment")
+    if not new_name and not plate:
+        return None, None
+
+    try:
+        if new_name and not new_name.startswith("FUN_"):
+            ghidra_post(
+                "/rename_function_by_address",
+                params={
+                    "address": address,
+                    "program": program,
+                    "new_name": new_name,
+                },
+            )
+        if plate:
+            ghidra_post(
+                "/batch_set_comments",
+                data={
+                    "items": [
+                        {"address": address, "type": "PLATE", "text": plate}
+                    ]
+                },
+                params={"program": program},
+            )
+        ghidra_post("/save_program", params={"program": program})
+        bus_emit(
+            "archive_applied",
+            {
+                "key": func_key,
+                "address": address,
+                "name": new_name,
+                "score": match.get("score"),
+                "matched_from": full.get("binary_name"),
+                "matched_version": full.get("version"),
+            },
+        )
+        return "archive_applied", match.get("score") or live_score
+    except Exception as exc:
+        bus_emit(
+            "archive_apply_failed",
+            {"key": func_key, "address": address, "error": str(exc)[:200]},
+        )
+        return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -4625,6 +4911,17 @@ _MINIMAX_DOC_TOOL_ALLOWLIST = {
     "set_disassembly_comment",
     "set_decompiler_comment",
     "apply_data_type",
+    # ── Globals (v5.7.0+) ────────────────────────────────────────────────
+    # `set_global` is the canonical atomic writer for global variables
+    # (type + array_length + name + plate in one transaction). Without
+    # these three, the globals worker model burns 5-10 wasted tool calls
+    # fighting `apply_data_type` + `rename_or_label` + `batch_set_comments`
+    # individually — exactly what was observed in production on the
+    # ExceptionList global. Audit endpoints are read-only but required so
+    # the model can verify its own writes mid-turn.
+    "set_global",
+    "audit_global",
+    "audit_globals_in_function",
     # ── Data types ────────────────────────────────────────────────────────
     "create_struct",
     "add_struct_field",
@@ -6135,6 +6432,36 @@ def process_function(
     live_score = data.get("score")
     print(f"done")
 
+    # Phase 3 read hook: if this function is still default-named (FUN_*),
+    # ask the cross-version archive whether we already documented this
+    # exact function (or one byte-identical to it) somewhere else. On a
+    # high-confidence match the archive doc is applied locally and we
+    # skip the LLM entirely. See check_archive_for_match() for details.
+    #
+    # Only fires for default-named auto-mode runs — manual runs and
+    # already-named functions get the normal flow so the user / scorer
+    # see the LLM's work product. Conservative apply (rename + plate
+    # only) is intentional; richer fields stay for a follow-up worker
+    # pass that benefits from the now-named-context.
+    if not manual and func_name and func_name.startswith("FUN_"):
+        archive_result, archive_score = check_archive_for_match(
+            func, func_name, live_score, run_id
+        )
+        if archive_result == "archive_applied":
+            func["last_result"] = "archive_applied"
+            func["last_processed"] = datetime.now().isoformat()
+            func["score"] = archive_score
+            update_function_state(func_key, func)
+            auto_dequeue_if_done(
+                func_key, archive_score, source="archive_applied"
+            )
+            return _finish(
+                "completed",
+                logged_result="archive_applied",
+                score_after=archive_score,
+                reason="cross-version archive hash-match auto-applied",
+            )
+
     # Defensive one-shot blacklist: if any decompile-heavy endpoint hit a
     # read timeout while fetching, the function is pathological (decompile
     # takes longer than the scoring path allows). Mark it and bail so the
@@ -7218,6 +7545,64 @@ def process_function(
     if result in ("completed", "needs_redo", "partial") and tool_calls_made > 0:
         ghidra_post("/save_program", params={"program": program})
 
+    # Cross-version doc archive write hook (Phase 2).
+    #
+    # Push the just-completed/refined function's documentation to the
+    # cross-version archive at re_kb.functions on bsim Postgres. This
+    # captures the worker's output for future reuse: a fresh fun-doc run
+    # on a different version of the same binary (or a related mod) can
+    # tier-1 hash-match the archive entry and skip the LLM call entirely.
+    #
+    # Uses the Ghidra-side /archive_ingest_function tool which builds the
+    # payload from current Ghidra state (post-save) and POSTs to the
+    # archive's /v1/doc_archive/upsert endpoint. The archive performs
+    # field-level merge resolution server-side; conflicts beyond
+    # heuristics escalate to the AI judge queue.
+    #
+    # Best-effort: failure here never fails the worker pass. Skipped
+    # entirely on result=='stopped' or zero tool_calls_made (no real
+    # change to push). Skipped also for default-named functions where
+    # the worker hasn't actually documented anything useful yet.
+    if (
+        result in ("completed", "needs_redo", "partial")
+        and tool_calls_made > 0
+        and func_name is not None
+        and not func_name.startswith("FUN_")
+    ):
+        try:
+            archive_resp = ghidra_post(
+                "/archive_ingest_function",
+                params={
+                    "address": address,
+                    "program": program,
+                    "dry_run": "false",
+                },
+            )
+            bus_emit(
+                "archive_pushed",
+                {
+                    "key": func_key,
+                    "address": address,
+                    "name": func_name,
+                    "score": new_score,
+                    "result": result,
+                    "archive_function_id": (archive_resp or {}).get("function_id"),
+                    "archive_created": (archive_resp or {}).get("created"),
+                    "archive_field_actions": (archive_resp or {}).get("field_actions"),
+                    "archive_conflicts": (archive_resp or {}).get("conflicts_enqueued"),
+                },
+            )
+        except Exception as exc:
+            # Never let archive push failures kill the worker pass.
+            bus_emit(
+                "archive_push_failed",
+                {
+                    "key": func_key,
+                    "address": address,
+                    "error": str(exc)[:200],
+                },
+            )
+
     # Auto-dequeue on successful completion if the user explicitly queued this
     # function and it reached the good-enough threshold.
     if result == "completed":
@@ -7412,11 +7797,31 @@ def main():
         bus = get_bus()
         app, socketio = create_app(STATE_FILE, event_bus=bus)
         dashboard_url = f"http://127.0.0.1:{args.web_port}"
-        print(f"Starting web dashboard at {dashboard_url}")
-        import webbrowser
+        print(f"Starting web dashboard at {dashboard_url}", flush=True)
 
-        webbrowser.open(dashboard_url)
-        socketio.run(app, host="127.0.0.1", port=args.web_port, debug=False)
+        # Browser open is best-effort and skippable in non-interactive shells
+        # (CI, nohup, ssh-detached). On some Windows configurations webbrowser.open
+        # can block waiting for a default-handler dialog; that hangs the entire
+        # launch. Honor FUN_DOC_NO_BROWSER=1 to skip it entirely.
+        if os.environ.get("FUN_DOC_NO_BROWSER", "").lower() not in ("1", "true", "yes"):
+            try:
+                import webbrowser
+                webbrowser.open(dashboard_url)
+            except Exception as _e:
+                print(f"  (skipping browser open: {_e})", flush=True)
+
+        # Flask-SocketIO 5.x with Werkzeug 3.x refuses to start the dev server
+        # without the allow_unsafe_werkzeug opt-in. Without this flag the call
+        # raises a RuntimeError that the launcher silently swallows, leaving
+        # the process alive but with no port bound — exactly the "starts then
+        # exits" symptom users hit when launching the dashboard directly.
+        socketio.run(
+            app,
+            host="127.0.0.1",
+            port=args.web_port,
+            debug=False,
+            allow_unsafe_werkzeug=True,
+        )
         return
 
     # Auto-start dashboard in background (unless disabled)
@@ -7768,6 +8173,815 @@ def main():
                 time.sleep(1)
         except KeyboardInterrupt:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Globals worker (v5.7.x — Q1-Q12 design)
+# ---------------------------------------------------------------------------
+#
+# Parallels the function worker but at binary scope: one binary at a time,
+# one provider call per global. WorkerManager.start_worker dispatches here
+# when worker["mode"] == "globals". See `prompts/worker-globals.md` for the
+# per-global prompt.
+#
+# Per-design (locked Q1-Q12):
+#   * Q3=C: one provider call per global (max fault tolerance)
+#   * Q4=A: count input caps total globals processed in this run
+#   * Q5=A: continuous mode advances to the next most-needy binary
+#   * Q7=B: dedicated `worker-globals.md` prompt (refers to step-globals.md)
+#   * Q8=A: pre-audit (skip clean) + post-audit (verify fix)
+#   * Q10=A: invalidate inventory record on binary completion → scorer re-walks
+#   * Q11=A: per-binary lock (handled in WorkerManager)
+#   * Q12=A: runs.jsonl rows tagged with `mode: "globals"`
+# ---------------------------------------------------------------------------
+
+
+# Names that come straight from a Windows PE's OS-defined symbols
+# (TIB/PEB/KUSER_SHARED_DATA). Renaming any of these to a `g_*` form
+# is wrong — Microsoft's name IS the canonical convention. The audit
+# still flags them today (until we ship the Java-side exemption); the
+# worker pre-filters them so we never burn a provider call asking the
+# model to "fix" a label that shouldn't be touched.
+_OS_CANONICAL_GLOBAL_NAMES = frozenset({
+    # NT_TIB / TEB members (kept lower-cased for case-insensitive match)
+    "exceptionlist", "stackbase", "stacklimit", "subsystemtib",
+    "fiberdata", "arbitraryuserpointer", "self", "environmentpointer",
+    "clientid", "activerpchandle", "threadlocalstoragepointer",
+    "processenvironmentblock", "lastcomstatus", "tlsslots",
+    "vdm", "reservedforntrpc", "instrumentationcallback",
+    # KUSER_SHARED_DATA fields commonly seen at 0x7ffe****
+    "kuser_shared_data", "interrupttime", "systemtime",
+    "tickcountmultiplier", "ntmajorversion", "ntminorversion",
+})
+
+
+# Symbol-name patterns that indicate the address is a function /
+# library helper that slipped into /list_globals as a label, not a
+# real data global. The Java audit's code-address guard catches these
+# at the source after redeploy; this Python list is the belt-and-
+# suspenders fallback for sessions where the new plugin isn't loaded.
+_FUNCTION_SYMBOL_NAME_PREFIXES = (
+    "FID_conflict:",   # FLIRT/FID library matches with conflicts
+    "FID_",            # plain FLIRT matches
+    "FUN_",            # Ghidra auto-generated function names
+    "thunk_",          # imported thunks
+    "j_",              # IDA-style jump-thunk prefix
+    "_imp_",           # import table entries (sometimes labeled as data)
+    "__imp_",
+)
+
+
+def _looks_like_function_label(name):
+    """Return True when the symbol name patterns indicate this is a
+    function entry / library helper, not a data global. Belt-and-
+    suspenders fallback so the worker doesn't burn provider calls on
+    these even before the Java audit's code-address guard is deployed."""
+    if not name:
+        return False
+    for prefix in _FUNCTION_SYMBOL_NAME_PREFIXES:
+        if name.startswith(prefix):
+            return True
+    return False
+
+
+def _is_os_canonical_global(name, address):
+    """Check whether a global is an OS-canonical label that should be
+    skipped instead of documented. Returns True for known TIB/PEB/KUSER
+    symbols (by name match) or addresses in the well-known OS ranges
+    on x86 Windows. Defensive: unknown names in those ranges still
+    return True because user-set names there are extremely rare and
+    skipping a real one is much cheaper than re-renaming an OS field."""
+    if name and name.lower() in _OS_CANONICAL_GLOBAL_NAMES:
+        return True
+    if not address:
+        return False
+    try:
+        addr_int = int(address[2:] if address.startswith(("0x", "0X")) else address, 16)
+    except (ValueError, TypeError):
+        return False
+    # x86 Windows TIB lives at 0xffdf**** in the Ghidra default mapping
+    # (ram:ffdf0000). KUSER_SHARED_DATA lives at 0x7ffe**** (user-mode
+    # view) — also OS-managed. Both ranges are tiny and well-defined.
+    if 0xffdf0000 <= addr_int <= 0xffdfffff:
+        return True
+    if 0x7ffe0000 <= addr_int <= 0x7ffeffff:
+        return True
+    return False
+
+
+def _audit_global_via_http(prog_path, address):
+    """Adapter mirroring web.py's `_audit_global_via_mcp` so the globals
+    worker can call audit_global without depending on the dashboard's
+    closure scope. Returns the parsed dict or None on failure."""
+    resp = ghidra_get(
+        "/audit_global",
+        params={"program": prog_path, "address": address},
+        timeout=10,
+    )
+    if not resp:
+        return None
+    if isinstance(resp, str):
+        try:
+            return json.loads(resp)
+        except (json.JSONDecodeError, ValueError):
+            return None
+    return resp
+
+
+def _list_global_addresses(prog_path):
+    """Page through `/list_globals` and return the list of `0x<hex>`
+    addresses. Mirrors web.py's `_list_globals_for_program` so the worker
+    sees the same set the scorer sees."""
+    page_size = 500
+    max_pages = 200
+    line_re = re.compile(r"@\s+([0-9a-fA-F]{4,})\b")
+    out = []
+    seen = set()
+    for page_idx in range(max_pages):
+        offset = page_idx * page_size
+        resp = ghidra_get(
+            "/list_globals",
+            params={
+                "program": prog_path,
+                "offset": offset,
+                "limit": page_size,
+            },
+            timeout=30,
+        )
+        if not resp:
+            break
+        page_entries = []
+        if isinstance(resp, str):
+            try:
+                parsed = json.loads(resp)
+            except (json.JSONDecodeError, ValueError):
+                parsed = None
+            if isinstance(parsed, (dict, list)):
+                resp = parsed
+            else:
+                for line in resp.splitlines():
+                    m = line_re.search(line)
+                    if m:
+                        page_entries.append(f"0x{m.group(1)}")
+        if isinstance(resp, dict):
+            items = (
+                resp.get("items")
+                or resp.get("globals")
+                or resp.get("results")
+                or []
+            )
+            for item in items:
+                if isinstance(item, dict):
+                    addr = item.get("address") or item.get("addr")
+                    if addr:
+                        page_entries.append(
+                            addr if str(addr).startswith("0x") else f"0x{addr}"
+                        )
+        elif isinstance(resp, list):
+            for item in resp:
+                if isinstance(item, dict):
+                    addr = item.get("address") or item.get("addr")
+                    if addr:
+                        page_entries.append(
+                            addr if str(addr).startswith("0x") else f"0x{addr}"
+                        )
+        new_count = 0
+        for addr in page_entries:
+            if addr not in seen:
+                seen.add(addr)
+                out.append(addr)
+                new_count += 1
+        if new_count == 0 or len(page_entries) < page_size:
+            break
+    return out
+
+
+def _invalidate_global_inventory(prog_path):
+    """Drop a binary's record from `global_inventory.json` so the scorer
+    treats it as never-walked on the next loop iteration (the scorer's
+    sentinel kicks in for missing records, bypassing the cooldown).
+    Per Q10 — the worker doesn't write inventory records itself; it only
+    invalidates so the scorer's single-writer invariant stays intact."""
+    try:
+        from global_scorer import (
+            load_inventory as _load_g_inv,
+            save_inventory as _save_g_inv,
+        )
+
+        state_dir = SCRIPT_DIR
+        data = _load_g_inv(state_dir)
+        bins = data.get("binaries") or {}
+        if prog_path in bins:
+            bins.pop(prog_path, None)
+            data["binaries"] = bins
+            _save_g_inv(state_dir, data)
+    except Exception as exc:  # noqa: BLE001 — invalidation is best-effort
+        print(
+            f"  [globals-worker] inventory invalidate failed for {prog_path}: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+
+def _build_global_prompt(prog_path, address, audit_before, prompt_dir=None):
+    """Construct the per-global prompt by combining `worker-globals.md`,
+    `step-globals.md` (the rules source of truth), and the address-specific
+    audit dump. Kept as plain string concatenation so the model sees a
+    single coherent message.
+
+    The prompt is prefaced with a HARD instruction that EVERY tool call
+    must include `program=<full_path>`. Without this, the model often
+    omits the optional program param, and Ghidra silently routes the
+    write to whichever program is "current" in the UI — which (with
+    multiple programs open) is rarely the one the worker is processing.
+    Symptom: set_global "succeeds" but audit_global on the same address
+    keeps reporting unchanged state, and the worker reports `no_change`
+    despite 5+ successful write calls. See the production bug on
+    `g_pPerformanceCounterEntries @ 0x6ff82f48` in Fog.dll."""
+    base_dir = Path(prompt_dir) if prompt_dir else (SCRIPT_DIR / "prompts")
+    parts = []
+    # MANDATORY-PROGRAM banner first — placed before everything else so
+    # the model can't miss it. Repeats the exact path so there's no
+    # ambiguity.
+    parts.append(
+        f"# CRITICAL: pass `program=\"{prog_path}\"` to EVERY tool call.\n\n"
+        f"You are processing a global in the program `{prog_path}`.\n"
+        f"Multiple programs are open in this Ghidra session. If you call\n"
+        f"`set_global`, `apply_data_type`, `rename_or_label`,\n"
+        f"`rename_global_variable`, `batch_set_comments`, `audit_global`,\n"
+        f"or any other write/audit tool **without** the `program` parameter,\n"
+        f"Ghidra will route it to whichever program is currently focused in\n"
+        f"the UI — almost certainly NOT this one. The write will silently\n"
+        f"go to the wrong binary, the audit on this address will keep\n"
+        f"reporting unchanged state, and your turn will produce zero\n"
+        f"effective progress.\n\n"
+        f"**Always pass `program=\"{prog_path}\"` (exactly that string) to\n"
+        f"every tool call in this turn.**\n\n---\n\n"
+    )
+    try:
+        parts.append((base_dir / "worker-globals.md").read_text(encoding="utf-8"))
+    except OSError as exc:
+        parts.append(f"# Worker prompt missing ({exc})\n")
+    try:
+        parts.append("\n\n---\n\n# Reference: step-globals.md\n\n")
+        parts.append((base_dir / "step-globals.md").read_text(encoding="utf-8"))
+    except OSError:
+        # step-globals.md missing isn't fatal — worker-globals.md inlines
+        # the issue table. Carry on.
+        pass
+    parts.append("\n\n---\n\n## Target\n")
+    parts.append(f"- Program: `{prog_path}` ← pass this as `program=` on every tool call\n")
+    parts.append(f"- Address: `{address}`\n")
+    parts.append("\n## Audit (before)\n```json\n")
+    parts.append(json.dumps(audit_before, indent=2, default=str))
+    parts.append("\n```\n")
+    return "".join(parts)
+
+
+def process_global(
+    prog_path,
+    address,
+    *,
+    provider,
+    model,
+    max_turns=None,
+    worker_id=None,
+    on_started=None,
+):
+    """Process a single global address. Returns one of:
+        "completed"  — issues went from N>0 to 0
+        "improved"   — issues went down but didn't reach 0
+        "no_change"  — issues unchanged (provider didn't help)
+        "regressed"  — issues went up
+        "skipped"    — pre-audit said clean already (counted, not invoked)
+        "blocked"    — provider returned an error / quota_paused
+        "audit_fail" — pre or post audit returned no data
+    Always appends one row to runs.jsonl with `mode="globals"`.
+
+    `model` resolution: if the caller doesn't pass an explicit model,
+    we look up the dashboard-configured FULL-mode model for the given
+    provider (same fallback function workers use). This avoids the
+    "No model configured" error when the dashboard hands None through."""
+    run_id = str(uuid.uuid4())[:8]
+    started_at = datetime.now()
+
+    # Resolve the model before calling the provider — _require_model_name
+    # (called inside _invoke_provider_direct) only checks the literal arg,
+    # so we need to fill in the configured default ourselves. Same lookup
+    # function workers use (`get_configured_model`).
+    if not model:
+        try:
+            model = get_configured_model(provider, "FULL")
+        except Exception:
+            model = None
+    if max_turns is None:
+        try:
+            cfg = (load_priority_queue().get("config") or {})
+            pmt = (cfg.get("provider_max_turns") or {}).get(provider) or {}
+            max_turns = int(pmt.get("FULL") or 25)
+        except Exception:
+            max_turns = 25
+
+    audit_before = _audit_global_via_http(prog_path, address)
+    if audit_before is None:
+        _append_run_log(
+            {
+                "run_id": run_id,
+                "timestamp": started_at.isoformat(),
+                "worker_id": worker_id,
+                "mode": "globals",
+                "program": prog_path,
+                "address": address,
+                "provider": provider,
+                "model": model,
+                "result": "audit_fail",
+                "error": "audit_global returned None (pre)",
+            }
+        )
+        return "audit_fail"
+
+    issues_before = list(audit_before.get("issues") or [])
+    name_before = audit_before.get("name") or ""
+
+    # Pre-audit short-circuit: clean global, skip the provider call.
+    if not issues_before:
+        _append_run_log(
+            {
+                "run_id": run_id,
+                "timestamp": started_at.isoformat(),
+                "worker_id": worker_id,
+                "mode": "globals",
+                "program": prog_path,
+                "address": address,
+                "name": name_before,
+                "provider": provider,
+                "model": model,
+                "result": "skipped",
+                "issues_before": [],
+                "issues_after": [],
+                "fixed_count": 0,
+                "reason": "already_clean",
+            }
+        )
+        return "skipped"
+
+    # Function-label short-circuit. Names like `FID_conflict:__time32`,
+    # `FUN_*`, `thunk_*`, etc. indicate the address is code (a function
+    # entry or library helper), not a data global. The Java audit's
+    # code-address guard catches the same case at the audit layer once
+    # redeployed; this is the cheap pre-filter for sessions where the
+    # new plugin isn't yet loaded — saves a provider call apiece.
+    # Also catches the audit's `is_code_address` flag for the post-
+    # redeploy path (defense in depth).
+    if _looks_like_function_label(name_before) or audit_before.get("is_code_address"):
+        _append_run_log(
+            {
+                "run_id": run_id,
+                "timestamp": started_at.isoformat(),
+                "worker_id": worker_id,
+                "mode": "globals",
+                "program": prog_path,
+                "address": address,
+                "name": name_before,
+                "provider": provider,
+                "model": model,
+                "result": "skipped",
+                "issues_before": issues_before,
+                "issues_after": issues_before,
+                "fixed_count": 0,
+                "reason": "function_label",
+            }
+        )
+        return "skipped"
+
+    # OS-canonical short-circuit (TIB/PEB/KUSER labels). The audit flags
+    # these as missing g_ prefix etc., but renaming them is wrong — the
+    # Microsoft name is canonical. Skip without a provider call so we
+    # don't burn $ asking the model to confirm-and-skip 50 TIB entries
+    # in a row. Marked as `skipped` with a distinct reason so analytics
+    # can separate "already clean" from "OS-canonical".
+    if _is_os_canonical_global(name_before, address):
+        _append_run_log(
+            {
+                "run_id": run_id,
+                "timestamp": started_at.isoformat(),
+                "worker_id": worker_id,
+                "mode": "globals",
+                "program": prog_path,
+                "address": address,
+                "name": name_before,
+                "provider": provider,
+                "model": model,
+                "result": "skipped",
+                "issues_before": issues_before,
+                "issues_after": issues_before,
+                "fixed_count": 0,
+                "reason": "os_canonical_label",
+            }
+        )
+        return "skipped"
+
+    # Real work is about to happen — emit the started event so the
+    # dashboard opens a per-item bracket block (Q1=A reuses fn-block
+    # styling) and updates the worker title to this global. Skipped /
+    # audit_fail paths above don't emit events (Q4=B: no block when
+    # there's no real work). Console header mirrors the function worker's
+    # `name @ 0xaddress (program)` format (Q6=D: only when work happens).
+    # Address payload is normalized to the function-event convention:
+    # bare hex, no 0x prefix (the dashboard JS prepends 0x itself).
+    prog_name_for_log = Path(prog_path).name
+    addr_bare = address[2:] if address.startswith(("0x", "0X")) else address
+    # Worker-pane title hook — the worker manager updates progress.current
+    # so the gold "current item" segment of the title shows the symbol
+    # name as soon as it's known (mirrors function-worker behavior).
+    if on_started is not None:
+        try:
+            on_started(prog_path, address, name_before)
+        except Exception:
+            pass
+    bus_emit(
+        "global_started",
+        {
+            "key": f"{prog_path}::{addr_bare}",
+            "name": name_before or address,
+            "address": addr_bare,
+            "program": prog_name_for_log,
+            # Full program path lets the dashboard disambiguate between
+            # multiple versions of the same DLL (e.g., /Vanilla/1.13d/
+            # D2Game.dll vs /Mods/PD2-S12/D2Game.dll). The filename alone
+            # can mislead when you have several versions open and the
+            # addresses look "off" because you're viewing a different
+            # version than the worker is processing.
+            "program_path": prog_path,
+        },
+    )
+    print(f"\n  [{prog_path}] {name_before or address} @ 0x{addr_bare}")
+    print(f"  {'-' * 50}")
+
+    prompt = _build_global_prompt(prog_path, address, audit_before)
+    text, meta = _invoke_provider_direct(
+        prompt,
+        model=model,
+        max_turns=max_turns,
+        provider=provider,
+        complexity_tier=None,
+    )
+
+    quota_paused = bool((meta or {}).get("quota_paused"))
+    provider_error = (meta or {}).get("provider_error") or None
+
+    # Post-audit (always — even on provider error, so we know if anything
+    # partial landed on Ghidra side).
+    audit_after = _audit_global_via_http(prog_path, address)
+    if audit_after is None:
+        _append_run_log(
+            {
+                "run_id": run_id,
+                "timestamp": started_at.isoformat(),
+                "worker_id": worker_id,
+                "mode": "globals",
+                "program": prog_path,
+                "address": address,
+                "name": name_before,
+                "provider": provider,
+                "model": model,
+                "result": "audit_fail",
+                "issues_before": issues_before,
+                "issues_after": None,
+                "tool_calls": (meta or {}).get("tool_calls"),
+                "tool_calls_known": (meta or {}).get("tool_calls_known"),
+                "error": "audit_global returned None (post)",
+                "provider_error": provider_error,
+            }
+        )
+        # Close the bracket block we opened above so the dashboard
+        # doesn't leave a dangling header without a footer when the
+        # post-audit fails. The block contents (provider tool calls)
+        # are still useful diagnostic context.
+        bus_emit(
+            "global_complete",
+            {
+                "key": f"{prog_path}::{addr_bare}",
+                "name": name_before or address,
+                "address": addr_bare,
+                "program": prog_name_for_log,
+                "program_path": prog_path,
+                "result": "audit_fail",
+                "issues_before": issues_before,
+                "issues_after": None,
+                "fixed_count": 0,
+            },
+        )
+        return "audit_fail"
+
+    issues_after = list(audit_after.get("issues") or [])
+    name_after = audit_after.get("name") or name_before
+    fixed_count = max(0, len(issues_before) - len(issues_after))
+
+    # Severity-tiered completion (per design Q1=A): soft issues like
+    # `generic_descriptor` and `bytes_size_unknown` don't block
+    # "completed" — they're notes for a human reviewer, not work the
+    # worker can always finish on its own. Hard + medium count.
+    # The audit returns `severity_summary: {hard, medium, soft}`; when
+    # absent (older Ghidra plugin or pre-redeploy) we fall back to the
+    # legacy "any issue blocks" rule.
+    sev_after = audit_after.get("severity_summary") or {}
+    blocking_after = (sev_after.get("hard", 0) or 0) + (sev_after.get("medium", 0) or 0)
+    sev_before = audit_before.get("severity_summary") or {}
+    blocking_before = (sev_before.get("hard", 0) or 0) + (sev_before.get("medium", 0) or 0)
+
+    # When severity_summary is present, prefer the blocking_* counts for
+    # classification. When absent, fall back to issue-count comparisons.
+    has_severity = bool(sev_after) or bool(sev_before)
+
+    if quota_paused:
+        result = "blocked"
+    elif provider_error and (
+        (has_severity and blocking_after == 0) or (not has_severity and not issues_after)
+    ):
+        # Even errored providers occasionally land the write before failing.
+        result = "completed"
+    elif provider_error:
+        result = "blocked"
+    elif has_severity and blocking_after == 0:
+        # No hard or medium issues left — completed even if soft warnings remain.
+        result = "completed"
+    elif (not has_severity) and not issues_after:
+        result = "completed"
+    elif has_severity and blocking_after < blocking_before:
+        result = "improved"
+    elif (not has_severity) and len(issues_after) < len(issues_before):
+        result = "improved"
+    elif has_severity and blocking_after > blocking_before:
+        result = "regressed"
+    elif (not has_severity) and len(issues_after) > len(issues_before):
+        result = "regressed"
+    elif sorted(issues_after) == sorted(issues_before):
+        # Identical issue set — provider truly did nothing useful.
+        result = "no_change"
+    else:
+        # Same count, different content — model fixed one issue and
+        # introduced (or simply traded for) another. Don't lie about
+        # this as "no_change"; surface it so the user can spot patterns
+        # like "model keeps fixing names but breaking plates".
+        result = "lateral_change"
+
+    _append_run_log(
+        {
+            "run_id": run_id,
+            "timestamp": started_at.isoformat(),
+            "worker_id": worker_id,
+            "mode": "globals",
+            "program": prog_path,
+            "address": address,
+            "name": name_after,
+            "name_before": name_before,
+            "provider": provider,
+            "model": model,
+            "result": result,
+            "issues_before": issues_before,
+            "issues_after": issues_after,
+            "fixed_count": fixed_count,
+            "tool_calls": (meta or {}).get("tool_calls"),
+            "tool_calls_known": (meta or {}).get("tool_calls_known"),
+            "input_tokens": (meta or {}).get("input_tokens"),
+            "output_tokens": (meta or {}).get("output_tokens"),
+            "provider_error": provider_error,
+            "quota_paused": quota_paused,
+            "quota_paused_until": (meta or {}).get("quota_paused_until"),
+        }
+    )
+
+    # Close the per-item bracket block on the dashboard. Mirrors the
+    # function worker's function_complete event shape so the same JS
+    # block-closer can reuse the same handler signature. Skipped /
+    # audit_fail paths above don't emit, matching the no-block-no-event
+    # invariant from Q4=B.
+    bus_emit(
+        "global_complete",
+        {
+            "key": f"{prog_path}::{addr_bare}",
+            "name": name_after or address,
+            "address": addr_bare,
+            "program": prog_name_for_log,
+            "program_path": prog_path,
+            "result": result,
+            "issues_before": issues_before,
+            "issues_after": issues_after,
+            "fixed_count": fixed_count,
+        },
+    )
+    return result
+
+
+def _pick_next_globals_binary(programs, exclude_binaries):
+    """Continuous-mode: pick the next binary with the most issue-globals
+    that isn't currently being processed. Reads `global_inventory.json`
+    for the count; ignores cooldown because the worker is actively making
+    changes that will lower the count. `programs` is the project's
+    program list ({name, path}); `exclude_binaries` is the set of paths
+    already being handled by another globals worker (per-binary lock)."""
+    try:
+        from global_scorer import load_inventory as _load_g_inv
+
+        inv = _load_g_inv(SCRIPT_DIR).get("binaries") or {}
+    except Exception:
+        return None
+    candidates = []
+    program_paths = {p.get("path") for p in (programs or [])}
+    for path, rec in inv.items():
+        if path in exclude_binaries:
+            continue
+        if path not in program_paths:
+            continue
+        total = rec.get("total_documentable", 0) or 0
+        fully = rec.get("fully_documented", 0) or 0
+        with_issues = max(0, total - fully)
+        if with_issues <= 0:
+            continue
+        candidates.append((with_issues, rec.get("name") or Path(path).name, path))
+    if not candidates:
+        return None
+    # Largest issues first; reverse-alpha tiebreak.
+    candidates.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    return candidates[0][2]
+
+
+def run_globals_worker_pass(
+    *,
+    worker_id,
+    initial_binary,
+    provider,
+    model,
+    count,
+    continuous,
+    stop_flag,
+    on_progress=None,
+    on_started=None,
+    exclude_binaries_provider=None,
+):
+    """Orchestrate a globals worker run. Processes up to `count` globals
+    across one or more binaries (continuous mode advances to the next
+    most-needy binary when the current one is exhausted). Returns a
+    summary dict for the caller to log/emit.
+
+    `stop_flag` is a threading.Event the WorkerManager sets to interrupt.
+    `on_progress` is an optional callable invoked after each global with
+        (binary_path, address, result, processed, count).
+    `exclude_binaries_provider` is an optional callable that returns the
+        set of binary paths currently held by other globals workers (for
+        per-binary lock when picking a continuation binary)."""
+    summary = {
+        "binaries_visited": [],
+        "totals": {
+            "completed": 0,
+            "improved": 0,
+            "no_change": 0,
+            "regressed": 0,
+            "skipped": 0,
+            "blocked": 0,
+            "audit_fail": 0,
+        },
+        "stopped": False,
+        "stopped_reason": None,
+    }
+
+    processed = 0
+    current_binary = initial_binary
+    visited_paths = set()
+
+    # Continuous mode (the dashboard's "Auto" toggle) means run until the
+    # binary is drained — and then keep going to the next most-needy binary
+    # — not "stop at count". Mirrors the function-worker semantics at
+    # web.py: `worker["continuous"] or processed < worker["count"]`.
+    # Without this bypass, an Auto run with the dashboard's default count=10
+    # stops at 10 even though the user clicked Auto expecting unbounded.
+    while current_binary and (continuous or processed < count):
+        if stop_flag.is_set():
+            summary["stopped"] = True
+            summary["stopped_reason"] = "user_stop"
+            break
+
+        summary["binaries_visited"].append(current_binary)
+        visited_paths.add(current_binary)
+        prog_name = Path(current_binary).name
+        print(
+            f"  [globals-worker {worker_id}] {prog_name}: enumerating globals",
+            flush=True,
+        )
+        addresses = _list_global_addresses(current_binary)
+        if not addresses:
+            print(
+                f"  [globals-worker {worker_id}] {prog_name}: list_globals "
+                f"returned empty — skipping",
+                flush=True,
+            )
+            _invalidate_global_inventory(current_binary)
+            current_binary = (
+                _pick_next_globals_binary(
+                    _fetch_programs(load_state().get("project_folder") or "/"),
+                    (exclude_binaries_provider() if exclude_binaries_provider else set())
+                    | visited_paths,
+                )
+                if continuous
+                else None
+            )
+            continue
+
+        binary_done = False
+        for address in addresses:
+            if stop_flag.is_set():
+                summary["stopped"] = True
+                summary["stopped_reason"] = "user_stop"
+                binary_done = True
+                break
+            if not continuous and processed >= count:
+                summary["stopped_reason"] = "count_reached"
+                binary_done = True
+                break
+
+            result = process_global(
+                current_binary,
+                address,
+                provider=provider,
+                model=model,
+                worker_id=worker_id,
+                on_started=on_started,
+            )
+            summary["totals"][result] = summary["totals"].get(result, 0) + 1
+            # `skipped` results don't count toward the cap — they're cheap
+            # filter passes, not real work.
+            if result != "skipped":
+                processed += 1
+            if on_progress:
+                try:
+                    on_progress(current_binary, address, result, processed, count)
+                except Exception:
+                    pass
+
+            if result == "blocked":
+                # Quota-pause or provider error — stop the binary; the
+                # outer worker loop / WorkerManager handles quota waits.
+                summary["stopped_reason"] = "blocked"
+                binary_done = True
+                break
+        else:
+            # Loop completed naturally — exhausted this binary's globals.
+            binary_done = True
+
+        # Invalidate this binary's cached inventory so the scorer re-walks it
+        # and the dashboard reflects the worker's writes.
+        _invalidate_global_inventory(current_binary)
+
+        # In continuous (Auto) mode the count cap is ignored — keep
+        # advancing to the next binary until none remain, the user stops
+        # us, or a provider quota wall trips. Non-continuous mode does
+        # one binary and stops (the original semantic).
+        if not continuous or summary.get("stopped_reason") == "blocked":
+            break
+        # Pick the next binary to drain (per Q5).
+        try:
+            programs = _fetch_programs(load_state().get("project_folder") or "/")
+        except Exception:
+            programs = []
+        excluded = (
+            exclude_binaries_provider() if exclude_binaries_provider else set()
+        ) | visited_paths
+        current_binary = _pick_next_globals_binary(programs, excluded)
+        if not current_binary:
+            summary["stopped_reason"] = "no_more_binaries"
+            break
+
+        # Q5=C: emit a bold section heading event so the dashboard pane
+        # marks the binary boundary visibly. Worker-side console gets a
+        # heading line too for parity with the dashboard.
+        next_name = Path(current_binary).name
+        bus_emit(
+            "globals_binary_advanced",
+            {
+                "worker_id": worker_id,
+                "binary": current_binary,
+                "binary_name": next_name,
+                "timestamp": datetime.now().isoformat(),
+            },
+        )
+        print(
+            f"\n  === {next_name} === "
+            f"({datetime.now().strftime('%H:%M:%S')})",
+            flush=True,
+        )
+
+    if summary.get("stopped_reason") is None:
+        # In Auto/continuous mode the count cap doesn't terminate — exiting
+        # without an explicit reason means we ran out of binaries to drain.
+        if continuous:
+            summary["stopped_reason"] = "exhausted"
+        else:
+            summary["stopped_reason"] = (
+                "count_reached" if processed >= count else "exhausted"
+            )
+    summary["processed"] = processed
+    return summary
 
 
 if __name__ == "__main__":
