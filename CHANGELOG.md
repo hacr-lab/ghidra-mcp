@@ -4,14 +4,36 @@ Complete version history for the Ghidra MCP Server project.
 
 ---
 
-## v5.7.0 - 2026-04-25 (global variable documentation enforcement)
+## v5.7.0 - 2026-05-05 (globals quality, scope guard, archive integration)
 
-Release focused on bringing global variables up to the same documentation
+Release headline is bringing global variables up to the same documentation
 bar as functions: a four-axis "properly documented" standard
 (name + type + bytes formatted + plate comment) enforced at three layers
 (prompt + scorer + validator), three new MCP endpoints replacing the
 fragile 4-tool fix chain with a single atomic write, and a binary-wide
 bulk auditor mirroring the function inventory scorer pattern.
+
+Three additional themes added during release prep:
+
+- **Project-folder scope guard** — opt-in two-layer guard preventing
+  multi-version reverse-engineering from accidentally writing to the
+  wrong binary. Layer 1 fun-doc Python validation, Layer 2 Ghidra Java
+  `FrontEndProgramProvider` + `SecurityConfig.isPathInProjectScope`.
+  Off by default (env var `GHIDRA_MCP_PROJECT_FOLDER`); general users
+  see no behavior change.
+- **Cross-version doc archive integration** — fun-doc now mirrors
+  documented functions to a re-kb FastAPI service and reads from it
+  before invoking the LLM. On Q5-D gate pass (hash-exact OR BSim≥0.9
+  AND score≥80) it applies the archived name + plate via existing
+  MCP tools and skips the LLM. Two new MCP tools
+  (`archive_ingest_function`, `archive_ingest_program`).
+- **state.json truncation hardening** — root-caused and fixed an
+  incident where a duplicate `load_state()` in `web.py` raced a writer
+  for >3 retries, returned an empty stub, and saved that stub over
+  the real ~110 MB state.json. Now delegates to `fun_doc.load_state`
+  (5 retries → `.bak` fallback → raise) and uses `_atomic_write_state`
+  with a guardrail refusing to overwrite a populated state with an
+  empty-functions dict.
 
 ### Added
 
@@ -90,6 +112,61 @@ time, capped at -20 aggregate per function:
   recovery prompt builders. Documents the four-axis bar, the
   Hungarian-vs-type table, the canonical `audit_globals_in_function` →
   `set_global` workflow, and how to handle structured rejections.
+- **`prompts/hungarian-table.md`** — canonical single-source-of-truth
+  Hungarian prefix → type table, referenced by all the other globals
+  prompts (`step-globals.md`, `worker-globals.md`, `fix-hungarian.md`)
+  instead of being restated in each.
+- **`prompts/worker-globals.md`** — globals worker prompt covering the
+  Q1–Q12 design (process_global pre-audit short-circuit, completed/
+  no_change/regressed classification, runs.jsonl row shape with
+  `mode="globals"`).
+
+#### Globals worker
+
+- **`process_global`** in `fun_doc.py` — single-function globals
+  documentation entrypoint. Pre-audit short-circuits when the global
+  is already fully_documented; classifies completed/no_change/regressed
+  based on issue-list deltas; writes `runs.jsonl` rows with
+  `mode="globals"` for dashboard tracking.
+- **`run_globals_worker_pass`** — count-capped worker loop with
+  continuous-mode binary rotation and stop_flag interruption.
+- **`WorkerManager` mode dispatch** — recognizes `mode="globals"`,
+  requires a `binary` parameter, and rejects a second launch on the
+  same binary (Q11 per-binary lock prevents concurrent writes).
+
+#### Project-folder scope guard
+
+- **`SecurityConfig.isPathInProjectScope(domainFilePath)`** — collision-
+  safe equals-or-startsWith path matcher (a path "P/A" inside scope
+  "/P" must NOT match scope "/PA"). Reads `GHIDRA_MCP_PROJECT_FOLDER`
+  env var; null/unset disables the guard so general users see no
+  behavior change.
+- **`FrontEndProgramProvider.getProgram(name)`** — wraps existing
+  resolution with a scope check, returning a clear error if the
+  resolved DomainFile is outside the configured project folder.
+- **`scripts/launch-ghidra-scoped.ps1`** — convenience wrapper that
+  sets `$env:GHIDRA_MCP_PROJECT_FOLDER` then launches `ghidraRun.bat`.
+
+#### Cross-version doc archive integration
+
+- **`archive_ingest_function(address, program)`** — MCP tool in
+  `DocumentationHashService.java`. Builds the archive payload from the
+  current Ghidra state (locals, instruction comments, referenced data
+  types/globals/labels, equates, opcode hash, BSim signature when
+  available) and POSTs to the re-kb FastAPI service's
+  `/v1/doc_archive/upsert` endpoint.
+- **`archive_ingest_program(program)`** — bulk variant; iterates every
+  documented function in the program.
+- **fun-doc write hook** — after `save_program` in `process_function`,
+  pushes the freshly-documented function to the archive.
+- **fun-doc read hook** — before invoking the LLM, checks
+  `/v1/doc_archive/match`. On Q5-D gate pass (hash-exact OR BSim≥0.9
+  AND score≥80) applies the archived name + plate via existing MCP
+  tools and skips the LLM. Bus events `archive_pushed`,
+  `archive_lookup`, `archive_applied`, `archive_apply_failed`,
+  `archive_push_failed` for dashboard visibility.
+- Required env: `RE_KB_ARCHIVE_URL` (defaults to
+  `http://10.0.10.30:8422`); empty disables both hooks.
 
 ### Changed
 
@@ -99,6 +176,41 @@ time, capped at -20 aggregate per function:
   "rejected_name": ..., "current_type": ..., "message": ...,
   "suggestion": ...}`. Function unchanged on rejection. The model
   retries informed by the error rather than ignoring soft warnings.
+- **`set_global` array bounds validation** — added pre-flight rejection
+  for `array_length < 0` (`invalid_array_length`), `array_length > 0`
+  with empty `type_name` (`array_length_requires_type`), zero-length
+  element types (`invalid_element_size`), and overflow / sane-cap
+  exceedance (`array_too_large`, 16 MiB cap). Previously these slipped
+  through with misleading "success" responses or silent overflow.
+- **`web.py` state I/O hardening** — `load_state()` now delegates to
+  `fun_doc.load_state` (5 retries → `.bak` fallback → raise on corrupt),
+  and `_save_state_inline()` uses `_atomic_write_state` with a guardrail
+  refusing to overwrite a populated state.json with an empty-functions
+  stub. Eliminates the silent-truncation race that nuked ~110 MB of
+  state during the 2026-05-03 incident.
+
+### Fixed
+
+Three commits targeting silent-failure modes the production log audit
+surfaced; pairs with the v5.7.0 globals work since the same patterns
+were biting the globals worker:
+
+- **`set_variables` empty-map success** — now returns success (not
+  error) when the variables map is empty; matches `batch_set_comments`
+  semantics and lets prompts pass `{}` to mean "no-op." (`8a6b58d`)
+- **`set_local_variable_type` SSA-churn awareness** — type changes that
+  trigger re-decompilation surface a churn-aware error directing the
+  worker to call `get_function_variables` and retry via `set_variables`,
+  rather than failing opaquely. (`c9b1381`)
+- **Chained-rename worker redirect** — workers that previously chained
+  `rename_data` → `apply_data_type` → `batch_set_comments` are pushed
+  to use `set_global` instead, eliminating partial-application risk.
+  (`3f8e904`)
+- **`set_global` / `rename_or_label` / `rename_global_variable` name
+  idempotency** — same name on re-run is a no-op success, not a
+  `DuplicateNameException`. (`16840c8`)
+- **Three high-impact silent-error patterns** from prod log audit
+  hardened across the worker tools. (`56808c9`)
 
 ### Tests
 
