@@ -9,7 +9,21 @@ For the release preparation runbook, see
 
 ## Current Releases
 
-### v5.6.0 (Latest) — release regression + fun-doc workflow
+### v5.7.0 (Latest) — globals quality, scope guard, archive integration
+
+- **Four-axis "documented global" bar** — globals must have a meaningful name (`g_` + Hungarian + descriptor), a real type (not `undefined*`), bytes formatted to that type's expected length, and a plate comment with a meaningful one-line summary.
+- **`rename_data` / `rename_global_variable` validator gate** — hard-rejects names that fail `NamingConventions.checkGlobalNameQuality(name, type)` with a structured error including the conflicting issue, current type, and a concrete suggestion.
+- **New `audit_global` / `audit_globals_in_function` / `set_global` MCP endpoints** — read inspector, per-function bulk auditor, and atomic single-transaction writer. `set_global` applies type, optional `array_length`, name, and plate as a unit with pre-flight rejection (no partial writes), replacing the four-tool chain (`apply_data_type` → `rename_data` → `batch_set_comments` → `create_label`).
+- **Per-function scorer deductions** — four new categories cap globals quality at -20 aggregate (`untyped_global` -8, `unformatted_global_bytes` -5, `generic_global_name` -5, `missing_global_plate_comment` -3) so bad globals surface in the work queue at scoring time.
+- **Binary-wide bulk scorer** (`fun-doc/global_scorer.py`) — opt-in idle-time daemon mirroring `inventory_scorer.py`'s architecture; persists per-binary coverage to `fun-doc/global_inventory.json`. Dashboard "Global Inventory" panel shows per-binary table with retry on blacklist.
+- **Globals worker** — `process_global` pre-audit short-circuit, completed/no_change/regressed classification, `runs.jsonl` rows with `mode="globals"`. `WorkerManager` requires `binary` and rejects a second launch on the same binary (Q11 per-binary lock).
+- **Project-folder scope guard** — opt-in two-layer guard preventing multi-version work from accidentally writing to the wrong binary. Layer 1 fun-doc Python validation, Layer 2 Ghidra Java `FrontEndProgramProvider` + `SecurityConfig.isPathInProjectScope`. Off by default (`GHIDRA_MCP_PROJECT_FOLDER` env var).
+- **Cross-version doc archive integration** — fun-doc mirrors documented functions to the re-kb FastAPI service and reads from it before invoking the LLM. Q5-D gate (hash-exact OR BSim≥0.9 AND score≥80) applies the archived name + plate via existing MCP tools and skips the LLM. Two new MCP tools (`archive_ingest_function`, `archive_ingest_program`).
+- **state.json truncation hardening** — root-caused and fixed an incident where a duplicate `load_state()` raced a writer and saved an empty stub over the real state. `web.py` now delegates to `fun_doc.load_state` (5 retries → `.bak` → raise) and uses atomic-write with an empty-stub guardrail.
+
+- See [CHANGELOG.md](../../CHANGELOG.md) for full details.
+
+### v5.6.0 — release regression + fun-doc workflow
 
 Deploy / regression / debugger:
 

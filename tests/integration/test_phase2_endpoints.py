@@ -185,9 +185,15 @@ class TestGlobalVariables:
 
     @pytest.mark.requires_program
     def test_list_globals_with_filter(self, http_client):
-        """Test listing globals with filter."""
+        """Test listing globals with substring filter.
+
+        v5.7.x: the substring filter param was renamed from `filter` to
+        `name_substring` because `filter` is now the orthogonal axis param
+        (all/defined/undefined). Old callers passing `filter=<substring>`
+        will get an "invalid filter value" path through the new param.
+        """
         response = http_client.get("/list_globals", params={
-            "filter": "test",
+            "name_substring": "test",
             "limit": 10
         })
         assert response.status_code == 200

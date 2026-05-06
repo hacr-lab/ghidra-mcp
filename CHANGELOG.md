@@ -4,6 +4,236 @@ Complete version history for the Ghidra MCP Server project.
 
 ---
 
+## v5.7.0 - 2026-05-05 (globals quality, scope guard, archive integration)
+
+Release headline is bringing global variables up to the same documentation
+bar as functions: a four-axis "properly documented" standard
+(name + type + bytes formatted + plate comment) enforced at three layers
+(prompt + scorer + validator), three new MCP endpoints replacing the
+fragile 4-tool fix chain with a single atomic write, and a binary-wide
+bulk auditor mirroring the function inventory scorer pattern.
+
+Three additional themes added during release prep:
+
+- **Project-folder scope guard** — opt-in two-layer guard preventing
+  multi-version reverse-engineering from accidentally writing to the
+  wrong binary. Layer 1 fun-doc Python validation, Layer 2 Ghidra Java
+  `FrontEndProgramProvider` + `SecurityConfig.isPathInProjectScope`.
+  Off by default (env var `GHIDRA_MCP_PROJECT_FOLDER`); general users
+  see no behavior change.
+- **Cross-version doc archive integration** — fun-doc now mirrors
+  documented functions to a re-kb FastAPI service and reads from it
+  before invoking the LLM. On Q5-D gate pass (hash-exact OR BSim≥0.9
+  AND score≥80) it applies the archived name + plate via existing
+  MCP tools and skips the LLM. Two new MCP tools
+  (`archive_ingest_function`, `archive_ingest_program`).
+- **state.json truncation hardening** — root-caused and fixed an
+  incident where a duplicate `load_state()` in `web.py` raced a writer
+  for >3 retries, returned an empty stub, and saved that stub over
+  the real ~110 MB state.json. Now delegates to `fun_doc.load_state`
+  (5 retries → `.bak` fallback → raise) and uses `_atomic_write_state`
+  with a guardrail refusing to overwrite a populated state with an
+  empty-functions dict.
+
+### Added
+
+#### MCP endpoints
+
+- **`audit_global`** — read-only inspector. Returns address, name, type,
+  length, plate comment, xref count, and a structured `issues` list
+  (`generic_name`, `untyped`, `unformatted_bytes_length_mismatch`,
+  `unformatted_bytes_should_be_string`, `missing_plate_comment`,
+  `plate_comment_too_short`).
+- **`audit_globals_in_function`** — per-function bulk auditor. Walks
+  the function's instructions, collects unique data-reference targets,
+  audits each via the shared `auditGlobalAt` helper, and returns
+  `{function, globals: [...], summary: {total, fully_documented,
+  with_issues, issue_histogram}}`. The killer per-function pre-flight
+  tool — one MCP call instead of N.
+- **`set_global`** — atomic single-transaction write that applies type,
+  optional `array_length`, name, and plate comment as a unit. Pre-flight
+  validation rejects on naming/type/format failures with a structured
+  error (`status: "rejected"`, `error`, `issue`, `suggestion`). No
+  partial writes — either everything applies or nothing does. Replaces
+  the four-tool chain (`apply_data_type` → `rename_data` →
+  `batch_set_comments` → `create_label`).
+
+#### Per-function scorer deductions
+
+Four new categories surface bad globals in the work queue at scoring
+time, capped at -20 aggregate per function:
+
+- `untyped_global` -8 — referenced global has `undefined*` type.
+- `unformatted_global_bytes` -5 — wrong byte layout (length mismatch
+  or string-as-char).
+- `generic_global_name` -5 — auto-generated remnant or fails
+  `checkGlobalNameQuality`.
+- `missing_global_plate_comment` -3 — empty or `<4-word` first line.
+
+#### Binary-wide bulk scorer
+
+- **`fun-doc/global_scorer.py`** — opt-in idle-time daemon that walks
+  every binary in the Ghidra project tree, audits every global symbol,
+  and tallies per-binary `total_documentable` / `fully_documented`
+  counts. Mirrors `inventory_scorer.py`'s architecture: single-thread,
+  cooperative pause when doc workers run, session-only blacklist after
+  3 strikes, persisted to `fun-doc/global_inventory.json`. Most-globals-
+  with-issues-first ordering, reverse-alpha tiebreak.
+- **Dashboard "Global Inventory" panel** — per-binary table with coverage
+  bar, fully_documented / total / with_issues counts, percent, status,
+  last scan, and a Retry button on blacklisted rows. Live updates via
+  `global_inventory_status` WebSocket event.
+- **New endpoints** — `GET /api/global_inventory/status`,
+  `POST /api/global_inventory/toggle`,
+  `POST /api/global_inventory/clear_blacklist`.
+- **`global_inventory_enabled`** added to `DEFAULT_QUEUE_CONFIG` (default
+  False; opt-in via the dashboard toggle).
+
+#### Naming + plate-comment helpers
+
+- **`NamingConventions.checkGlobalNameQuality(name, type)`** — structured
+  global-name validator. Enforces `g_` prefix + Hungarian matching type +
+  ≥2-char descriptor + reject auto-generated remnants (`g_DAT_*`,
+  `g_PTR_*`, `g_FUN_*`, `g_LAB_*`, `g_SUB_*`, `g_<prefix>_<hex>`).
+  Conservative placeholders (`g_dwField1D0`, `g_pUnk20`) are accepted
+  per CLAUDE.md's underclaim convention.
+- **`NamingConventions.isAutoGeneratedGlobalName`** — recognizer for
+  Ghidra's auto-generated global symbols.
+- **`NamingConventions.checkGlobalPlateComment`** — shared helper used
+  by both `audit_global` and `set_global` so they apply the same
+  ≥4-word first-line rule.
+- **`DataTypeService.auditGlobalAt`** — public static helper; the
+  shared per-global audit routine called by `audit_global`,
+  `audit_globals_in_function`, and the new scorer deductions.
+
+#### Prompt
+
+- **`prompts/step-globals.md`** — new step module loaded by FULL and
+  recovery prompt builders. Documents the four-axis bar, the
+  Hungarian-vs-type table, the canonical `audit_globals_in_function` →
+  `set_global` workflow, and how to handle structured rejections.
+- **`prompts/hungarian-table.md`** — canonical single-source-of-truth
+  Hungarian prefix → type table, referenced by all the other globals
+  prompts (`step-globals.md`, `worker-globals.md`, `fix-hungarian.md`)
+  instead of being restated in each.
+- **`prompts/worker-globals.md`** — globals worker prompt covering the
+  Q1–Q12 design (process_global pre-audit short-circuit, completed/
+  no_change/regressed classification, runs.jsonl row shape with
+  `mode="globals"`).
+
+#### Globals worker
+
+- **`process_global`** in `fun_doc.py` — single-function globals
+  documentation entrypoint. Pre-audit short-circuits when the global
+  is already fully_documented; classifies completed/no_change/regressed
+  based on issue-list deltas; writes `runs.jsonl` rows with
+  `mode="globals"` for dashboard tracking.
+- **`run_globals_worker_pass`** — count-capped worker loop with
+  continuous-mode binary rotation and stop_flag interruption.
+- **`WorkerManager` mode dispatch** — recognizes `mode="globals"`,
+  requires a `binary` parameter, and rejects a second launch on the
+  same binary (Q11 per-binary lock prevents concurrent writes).
+
+#### Project-folder scope guard
+
+- **`SecurityConfig.isPathInProjectScope(domainFilePath)`** — collision-
+  safe equals-or-startsWith path matcher (a path "P/A" inside scope
+  "/P" must NOT match scope "/PA"). Reads `GHIDRA_MCP_PROJECT_FOLDER`
+  env var; null/unset disables the guard so general users see no
+  behavior change.
+- **`FrontEndProgramProvider.getProgram(name)`** — wraps existing
+  resolution with a scope check, returning a clear error if the
+  resolved DomainFile is outside the configured project folder.
+- **`scripts/launch-ghidra-scoped.ps1`** — convenience wrapper that
+  sets `$env:GHIDRA_MCP_PROJECT_FOLDER` then launches `ghidraRun.bat`.
+
+#### Cross-version doc archive integration
+
+- **`archive_ingest_function(address, program)`** — MCP tool in
+  `DocumentationHashService.java`. Builds the archive payload from the
+  current Ghidra state (locals, instruction comments, referenced data
+  types/globals/labels, equates, opcode hash, BSim signature when
+  available) and POSTs to the re-kb FastAPI service's
+  `/v1/doc_archive/upsert` endpoint.
+- **`archive_ingest_program(program)`** — bulk variant; iterates every
+  documented function in the program.
+- **fun-doc write hook** — after `save_program` in `process_function`,
+  pushes the freshly-documented function to the archive.
+- **fun-doc read hook** — before invoking the LLM, checks
+  `/v1/doc_archive/match`. On Q5-D gate pass (hash-exact OR BSim≥0.9
+  AND score≥80) applies the archived name + plate via existing MCP
+  tools and skips the LLM. Bus events `archive_pushed`,
+  `archive_lookup`, `archive_applied`, `archive_apply_failed`,
+  `archive_push_failed` for dashboard visibility.
+- Required env: `RE_KB_ARCHIVE_URL` (defaults to
+  `http://10.0.10.30:8422`); empty disables both hooks.
+
+### Changed
+
+- **`rename_data` / `rename_global_variable` validator gates** — hard-
+  reject names failing `checkGlobalNameQuality` with structured errors:
+  `{"status": "rejected", "error": "name_quality", "issue": ...,
+  "rejected_name": ..., "current_type": ..., "message": ...,
+  "suggestion": ...}`. Function unchanged on rejection. The model
+  retries informed by the error rather than ignoring soft warnings.
+- **`set_global` array bounds validation** — added pre-flight rejection
+  for `array_length < 0` (`invalid_array_length`), `array_length > 0`
+  with empty `type_name` (`array_length_requires_type`), zero-length
+  element types (`invalid_element_size`), and overflow / sane-cap
+  exceedance (`array_too_large`, 16 MiB cap). Previously these slipped
+  through with misleading "success" responses or silent overflow.
+- **`web.py` state I/O hardening** — `load_state()` now delegates to
+  `fun_doc.load_state` (5 retries → `.bak` fallback → raise on corrupt),
+  and `_save_state_inline()` uses `_atomic_write_state` with a guardrail
+  refusing to overwrite a populated state.json with an empty-functions
+  stub. Eliminates the silent-truncation race that nuked ~110 MB of
+  state during the 2026-05-03 incident.
+
+### Fixed
+
+Three commits targeting silent-failure modes the production log audit
+surfaced; pairs with the v5.7.0 globals work since the same patterns
+were biting the globals worker:
+
+- **`set_variables` empty-map success** — now returns success (not
+  error) when the variables map is empty; matches `batch_set_comments`
+  semantics and lets prompts pass `{}` to mean "no-op." (`8a6b58d`)
+- **`set_local_variable_type` SSA-churn awareness** — type changes that
+  trigger re-decompilation surface a churn-aware error directing the
+  worker to call `get_function_variables` and retry via `set_variables`,
+  rather than failing opaquely. (`c9b1381`)
+- **Chained-rename worker redirect** — workers that previously chained
+  `rename_data` → `apply_data_type` → `batch_set_comments` are pushed
+  to use `set_global` instead, eliminating partial-application risk.
+  (`3f8e904`)
+- **`set_global` / `rename_or_label` / `rename_global_variable` name
+  idempotency** — same name on re-run is a no-op success, not a
+  `DuplicateNameException`. (`16840c8`)
+- **Three high-impact silent-error patterns** from prod log audit
+  hardened across the worker tools. (`56808c9`)
+
+### Tests
+
+- **17 new offline JUnit tests** for `NamingConventions.checkGlobalNameQuality`
+  + `checkGlobalPlateComment` (53 total — was 47, +6 plate-comment).
+- **19 new offline Python tests** for `global_scorer.py` (ordering,
+  blacklist, pause-gate, persistence shape, threaded-class behavior).
+- **18 new live integration tests** in `tests/integration/test_global_endpoints.py`
+  exercising every rejection code, the no-partial-application contract
+  on `set_global`, the per-function bulk auditor's response shape, and
+  endpoint-catalog parity. Auto-skip with a clear "deploy first"
+  message when the live plugin doesn't have the new endpoints.
+- **`docs/releases/v5.7.0-VERIFY.md`** — manual verification checklist
+  walking the rejection table by hand for spot-checks.
+
+The fragile 4-tool fix chain still works for non-global data items;
+globals are encouraged to use `set_global` exclusively via the prompt.
+The validator + bulk scorer + per-function deductions provide three
+independent ways for sloppy globals to surface in the worker's
+attention.
+
+---
+
 ## v5.6.0 - 2026-04-25 (release regression + fun-doc workflow)
 
 Release covering deploy/regression safety, live benchmark coverage, debugger
